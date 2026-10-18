@@ -1,11 +1,14 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import '../../models/tor_status.dart';
 
 class TorProcessManager {
+  static const MethodChannel _nativeChannel = MethodChannel('com.onionchat.tor_chat/native');
+
   Process? _torProcess;
   TorStatus _status = const TorStatus();
   final StreamController<TorStatus> _statusController = StreamController<TorStatus>.broadcast();
@@ -61,15 +64,27 @@ class TorProcessManager {
       if (await file.exists()) return file.path;
     }
 
+    // 1. On Android, check native library directory for libtor.so
+    if (Platform.isAndroid) {
+      try {
+        final String? nativePath = await _nativeChannel.invokeMethod<String>('getNativeTorPath');
+        if (nativePath != null && await File(nativePath).exists()) {
+          return nativePath;
+        }
+      } catch (e) {
+        _addLog('[notice] Native Android library query: $e');
+      }
+    }
+
     final exeName = Platform.isWindows ? 'tor.exe' : 'tor';
 
-    // 1. Check relative to current working directory (e.g. during development)
+    // 2. Check relative to current working directory (e.g. during desktop development)
     final devPath = p.join(Directory.current.path, 'assets', 'tor', 'windows', 'tor', exeName);
     if (await File(devPath).exists()) {
       return devPath;
     }
 
-    // 2. Check bundled with executable in release build
+    // 3. Check bundled with executable in desktop release build
     final resolvedExeDir = p.dirname(Platform.resolvedExecutable);
     final bundledPaths = [
       p.join(resolvedExeDir, 'data', 'flutter_assets', 'assets', 'tor', 'windows', 'tor', exeName),
@@ -82,7 +97,7 @@ class TorProcessManager {
       }
     }
 
-    // 3. Check AppData / AppSupport directory
+    // 4. Check AppData / AppSupport directory
     try {
       final appSupportDir = await getApplicationSupportDirectory();
       final appDataTor = p.join(appSupportDir.path, 'tor', exeName);
@@ -91,7 +106,7 @@ class TorProcessManager {
       }
     } catch (_) {}
 
-    // 4. Check system PATH
+    // 5. Check system PATH
     try {
       final res = await Process.run(Platform.isWindows ? 'where' : 'which', [exeName]);
       if (res.exitCode == 0 && res.stdout.toString().trim().isNotEmpty) {
@@ -119,16 +134,16 @@ class TorProcessManager {
     _updateStatus(_status.copyWith(
       state: TorConnectionState.starting,
       bootstrapProgress: 0,
-      bootstrapSummary: 'Locating Tor executable...',
+      bootstrapSummary: 'Locating Tor executable or running daemon...',
       socksPort: socksPort,
       controlPort: controlPort,
     ));
 
-    // First check if an existing Tor daemon is already running on socks/control port
+    // First check if an existing Tor daemon (e.g. Orbot on Android or system Tor daemon) is already running
     try {
       final testSock = await Socket.connect('127.0.0.1', controlPort, timeout: const Duration(seconds: 1));
       testSock.destroy();
-      _addLog('[notice] Detected existing Tor service running on ControlPort $controlPort');
+      _addLog('[notice] Detected existing Tor service running on ControlPort $controlPort (e.g. Orbot/daemon)');
       _updateStatus(_status.copyWith(
         state: TorConnectionState.connected,
         bootstrapProgress: 100,
@@ -141,7 +156,9 @@ class TorProcessManager {
 
     final torExe = await findTorExecutable(customPath: customExecutablePath);
     if (torExe == null) {
-      const err = 'Tor executable not found. Please ensure Tor is installed or bundled in assets.';
+      final err = Platform.isAndroid
+          ? 'Tor executable not found. On Android, you can also start Orbot (the official Tor app) to provide the Tor connection.'
+          : 'Tor executable not found. Please ensure Tor is installed or bundled in assets.';
       _updateStatus(_status.copyWith(
         state: TorConnectionState.error,
         errorMessage: err,

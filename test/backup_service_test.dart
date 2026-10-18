@@ -1,7 +1,6 @@
 import 'dart:convert';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:tor_chat/models/identity.dart';
-import 'package:tor_chat/services/storage/backup_service.dart';
 
 void main() {
   group('BackupService Crypto & Migration Tests', () {
@@ -26,7 +25,6 @@ void main() {
     });
 
     test('Encrypted backup payload round-trip check', () {
-      final service = BackupService();
       // Test the encryption helper through export/import structure
       final plainData = jsonEncode({
         'version': 1,
