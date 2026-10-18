@@ -286,3 +286,4 @@ class ChatCoordinator {
     await _torManager.stopTor();
   }
 }
+

@@ -105,3 +105,4 @@ class _CopyableTextState extends State<CopyableText> {
     );
   }
 }
+

@@ -42,3 +42,4 @@ class TorProvider extends ChangeNotifier {
     super.dispose();
   }
 }
+

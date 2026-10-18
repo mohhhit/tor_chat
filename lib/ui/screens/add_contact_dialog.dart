@@ -108,3 +108,4 @@ class _AddContactDialogState extends State<AddContactDialog> {
     );
   }
 }
+
