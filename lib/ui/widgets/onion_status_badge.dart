@@ -6,7 +6,9 @@ import '../screens/tor_settings_screen.dart';
 import '../theme/app_theme.dart';
 
 class OnionStatusBadge extends StatelessWidget {
-  const OnionStatusBadge({super.key});
+  final bool compact;
+
+  const OnionStatusBadge({super.key, this.compact = false});
 
   @override
   Widget build(BuildContext context) {
@@ -70,6 +72,31 @@ class OnionStatusBadge extends StatelessWidget {
               ),
             );
             break;
+        }
+
+        if (compact) {
+          return Tooltip(
+            message: 'Tor Status: $label (Tap for Settings)',
+            child: InkWell(
+              borderRadius: BorderRadius.circular(20),
+              onTap: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (_) => const TorSettingsScreen()),
+                );
+              },
+              child: Container(
+                padding: const EdgeInsets.all(8),
+                margin: const EdgeInsets.symmetric(horizontal: 4),
+                decoration: BoxDecoration(
+                  color: AppTheme.cardColor,
+                  shape: BoxShape.circle,
+                  border: Border.all(color: dotColor.withValues(alpha: 0.4), width: 1),
+                ),
+                child: icon,
+              ),
+            ),
+          );
         }
 
         return InkWell(

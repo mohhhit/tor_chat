@@ -1,13 +1,19 @@
+import 'dart:async';
+import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:intl/intl.dart';
 import 'package:provider/provider.dart';
+import '../../models/contact.dart';
 import '../../providers/chat_provider.dart';
+import '../../services/p2p/chat_coordinator.dart';
 import '../theme/app_theme.dart';
 import '../widgets/onion_status_badge.dart';
 import 'add_contact_dialog.dart';
 import 'chat_detail_screen.dart';
 import 'identity_screen.dart';
 import 'tor_settings_screen.dart';
+import '../../providers/tor_provider.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -19,9 +25,45 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> {
   final TextEditingController _searchController = TextEditingController();
   String _searchFilter = '';
+  StreamSubscription<String>? _chatNavSub;
+
+  @override
+  void initState() {
+    super.initState();
+    // On fresh app start, ensure no chat is auto-opened
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        context.read<ChatProvider>().selectChat(null);
+      }
+    });
+
+    _chatNavSub = ChatCoordinator.instance.chatSelectionRequests.listen((chatOnion) async {
+      if (!mounted) return;
+      final chatProvider = context.read<ChatProvider>();
+      await chatProvider.loadContacts();
+      final contact = chatProvider.contacts.cast<Contact?>().firstWhere(
+        (c) => c != null && c.onionAddress.toLowerCase() == chatOnion.toLowerCase(),
+        orElse: () => null,
+      );
+      if (contact != null && mounted) {
+        final isWide = MediaQuery.of(context).size.width >= 750;
+        if (!isWide) {
+          Navigator.push(
+            context,
+            MaterialPageRoute(
+              builder: (_) => ChatDetailScreen(contact: contact),
+            ),
+          ).then((_) {
+            chatProvider.selectChat(null);
+          });
+        }
+      }
+    });
+  }
 
   @override
   void dispose() {
+    _chatNavSub?.cancel();
     _searchController.dispose();
     super.dispose();
   }
@@ -31,6 +73,41 @@ class _HomeScreenState extends State<HomeScreen> {
       context: context,
       builder: (_) => const AddContactDialog(),
     );
+  }
+
+  void _confirmDeleteContact(Contact contact) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogCtx) => AlertDialog(
+        title: const Row(
+          children: [
+            Icon(Icons.delete_outline, color: AppTheme.errorRed),
+            SizedBox(width: 8),
+            Text('Delete Conversation'),
+          ],
+        ),
+        content: Text(
+          'Are you sure you want to delete the conversation with "${contact.nickname}" and all of its messages? This action cannot be undone.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogCtx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: AppTheme.errorRed,
+            ),
+            onPressed: () => Navigator.pop(dialogCtx, true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed == true && mounted) {
+      await context.read<ChatProvider>().deleteContact(contact.onionAddress);
+    }
   }
 
   @override
@@ -43,25 +120,54 @@ class _HomeScreenState extends State<HomeScreen> {
           c.onionAddress.toLowerCase().contains(q);
     }).toList();
 
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        final isWide = constraints.maxWidth >= 750;
+    return CallbackShortcuts(
+      bindings: <ShortcutActivator, VoidCallback>{
+        const SingleActivator(LogicalKeyboardKey.escape): () {
+          final cp = context.read<ChatProvider>();
+          if (cp.selectedContact != null) {
+            cp.selectChat(null);
+          }
+        },
+      },
+      child: Focus(
+        autofocus: true,
+        child: PopScope(
+          canPop: false,
+          onPopInvokedWithResult: (didPop, result) async {
+            if (didPop) return;
+            if (Platform.isAndroid) {
+              try {
+                const MethodChannel('com.onionchat.tor_chat/native').invokeMethod('moveToBackground');
+              } catch (_) {}
+            }
+          },
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              final isWide = constraints.maxWidth >= 750;
 
-        Widget contactsListWidget = Scaffold(
-          appBar: AppBar(
-            title: const Row(
-              children: [
-                Icon(Icons.security, color: AppTheme.torPurpleLight, size: 24),
-                SizedBox(width: 10),
-                Text('TorChat P2P', style: TextStyle(fontWeight: FontWeight.bold, letterSpacing: 0.5)),
-              ],
-            ),
-            actions: [
-              const OnionStatusBadge(),
-              const SizedBox(width: 8),
-              IconButton(
-                icon: const Icon(Icons.vpn_key_outlined),
+              Widget contactsListWidget = Scaffold(
+                appBar: AppBar(
+                  titleSpacing: 16,
+                  title: const Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(Icons.security, color: AppTheme.torPurpleLight, size: 20),
+                      SizedBox(width: 8),
+                      Flexible(
+                        child: Text(
+                          'TorChat',
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18, letterSpacing: 0.5),
+                        ),
+                      ),
+                    ],
+                  ),
+                  actions: [
+                    const OnionStatusBadge(compact: true),
+                    IconButton(
+                      icon: const Icon(Icons.vpn_key_outlined, size: 20),
                 tooltip: 'My Keys & Identity',
+                visualDensity: VisualDensity.compact,
                 onPressed: () {
                   Navigator.push(
                     context,
@@ -70,8 +176,9 @@ class _HomeScreenState extends State<HomeScreen> {
                 },
               ),
               IconButton(
-                icon: const Icon(Icons.settings_outlined),
+                icon: const Icon(Icons.settings_outlined, size: 20),
                 tooltip: 'Tor Settings & Logs',
+                visualDensity: VisualDensity.compact,
                 onPressed: () {
                   Navigator.push(
                     context,
@@ -79,7 +186,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   );
                 },
               ),
-              const SizedBox(width: 8),
+              const SizedBox(width: 4),
             ],
           ),
           body: Column(
@@ -110,6 +217,43 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
                 ),
               ),
+
+              // Android Background Activity Warning Banner
+              if (Platform.isAndroid && !context.watch<TorProvider>().isBatteryIgnored)
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                  child: Container(
+                    decoration: BoxDecoration(
+                      color: AppTheme.torPurple.withValues(alpha: 0.18),
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(color: AppTheme.torPurpleLight.withValues(alpha: 0.4)),
+                    ),
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                    child: Row(
+                      children: [
+                        const Icon(Icons.battery_alert_outlined, color: AppTheme.warningAmber, size: 22),
+                        const SizedBox(width: 10),
+                        const Expanded(
+                          child: Text(
+                            'Allow background activity so TorChat stays online when closed.',
+                            style: TextStyle(fontSize: 12, height: 1.25),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        TextButton(
+                          style: TextButton.styleFrom(
+                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                            visualDensity: VisualDensity.compact,
+                          ),
+                          onPressed: () {
+                            context.read<TorProvider>().requestIgnoreBatteryOptimization();
+                          },
+                          child: const Text('Allow', style: TextStyle(fontWeight: FontWeight.bold, color: AppTheme.torPurpleLight)),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
 
               // Contacts List
               Expanded(
@@ -240,16 +384,18 @@ class _HomeScreenState extends State<HomeScreen> {
                                   ),
                               ],
                             ),
+                            onLongPress: () => _confirmDeleteContact(c),
                             onTap: () {
-                              if (isWide) {
-                                chatProvider.selectChat(c);
-                              } else {
+                              chatProvider.selectChat(c);
+                              if (!isWide) {
                                 Navigator.push(
                                   context,
                                   MaterialPageRoute(
                                     builder: (_) => ChatDetailScreen(contact: c),
                                   ),
-                                );
+                                ).then((_) {
+                                  chatProvider.selectChat(null);
+                                });
                               }
                             },
                           );
@@ -276,7 +422,7 @@ class _HomeScreenState extends State<HomeScreen> {
           body: Row(
             children: [
               SizedBox(
-                width: 360,
+                width: 380,
                 child: contactsListWidget,
               ),
               const VerticalDivider(width: 1),
@@ -287,27 +433,56 @@ class _HomeScreenState extends State<HomeScreen> {
                         contact: chatProvider.selectedContact!,
                       )
                     : Center(
-                        child: Column(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: [
-                            Icon(Icons.shield_outlined, size: 72, color: AppTheme.textSecondary.withValues(alpha: 0.3)),
-                            const SizedBox(height: 16),
-                            const Text(
-                              'Select a conversation to start chatting',
-                              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-                            ),
-                            const SizedBox(height: 8),
-                            const Text(
-                              'All communications are routed directly over the decentralized Tor network.',
-                              style: TextStyle(color: AppTheme.textSecondary, fontSize: 13),
-                            ),
-                            const SizedBox(height: 24),
-                            OutlinedButton.icon(
-                              icon: const Icon(Icons.person_add, size: 18),
-                              label: const Text('Add Contact'),
-                              onPressed: _openAddContact,
-                            ),
-                          ],
+                        child: SingleChildScrollView(
+                          padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 24),
+                          child: Column(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              Container(
+                                width: 96,
+                                height: 96,
+                                decoration: BoxDecoration(
+                                  color: AppTheme.torPurple.withValues(alpha: 0.12),
+                                  shape: BoxShape.circle,
+                                ),
+                                child: const Icon(Icons.shield_outlined, size: 48, color: AppTheme.torPurpleLight),
+                              ),
+                              const SizedBox(height: 20),
+                              const Text(
+                                'TorChat for Windows',
+                                style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
+                              ),
+                              const SizedBox(height: 10),
+                              const Text(
+                                'Send and receive end-to-end encrypted messages over the Tor network.\nNo centralized servers, no phone numbers, complete peer-to-peer anonymity.',
+                                textAlign: TextAlign.center,
+                                style: TextStyle(color: AppTheme.textSecondary, fontSize: 13, height: 1.5),
+                              ),
+                              const SizedBox(height: 24),
+                              OutlinedButton.icon(
+                                icon: const Icon(Icons.person_add, size: 18),
+                                label: const Text('Add Contact'),
+                                style: OutlinedButton.styleFrom(
+                                  foregroundColor: AppTheme.torPurpleLight,
+                                  side: const BorderSide(color: AppTheme.torPurple),
+                                  padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+                                ),
+                                onPressed: _openAddContact,
+                              ),
+                              const SizedBox(height: 36),
+                              Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Icon(Icons.lock_outline, size: 13, color: AppTheme.textSecondary.withValues(alpha: 0.6)),
+                                  const SizedBox(width: 6),
+                                  Text(
+                                    'End-to-end encrypted with Onion V3 hidden services',
+                                    style: TextStyle(color: AppTheme.textSecondary.withValues(alpha: 0.6), fontSize: 11),
+                                  ),
+                                ],
+                              ),
+                            ],
+                          ),
                         ),
                       ),
               ),
@@ -315,6 +490,9 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
         );
       },
-    );
-  }
+    ),
+  ),
+  ),
+  );
+}
 }

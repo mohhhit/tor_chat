@@ -1,10 +1,13 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'package:path/path.dart' as p;
 import '../../models/message.dart';
+import 'chat_coordinator.dart';
 
-typedef OnMessageReceived = Future<void> Function(ChatMessage message, String? senderNickname);
+typedef OnMessageReceived = Future<MessageStatus?> Function(ChatMessage message, String? senderNickname);
 typedef OnReceiptReceived = Future<void> Function(String messageId, MessageStatus status);
+typedef OnMessageDeleted = Future<void> Function(String messageId, String senderOnion);
 
 class PeerServer {
   final int port;
@@ -13,6 +16,7 @@ class PeerServer {
   HttpServer? _server;
   OnMessageReceived? onMessageReceived;
   OnReceiptReceived? onReceiptReceived;
+  OnMessageDeleted? onMessageDeleted;
 
   PeerServer({
     this.port = 8765,
@@ -64,26 +68,64 @@ class PeerServer {
             ? DateTime.tryParse(timestampStr) ?? DateTime.now()
             : DateTime.now();
 
+        final typeStr = data['type'] as String? ?? 'text';
+        final messageType = MessageType.fromString(typeStr);
+        final isDeleted = (data['is_deleted'] == 1 || data['is_deleted'] == true);
+        String? savedMediaPath;
+
+        if (!isDeleted && messageType == MessageType.image && data['media_data'] != null) {
+          try {
+            final mediaBytes = base64Decode(data['media_data'] as String);
+            final mediaDir = await ChatCoordinator.instance.getMediaDirectory();
+            final fileName = '$id.jpg';
+            final mediaFile = File(p.join(mediaDir.path, fileName));
+            await mediaFile.writeAsBytes(mediaBytes);
+            savedMediaPath = mediaFile.path;
+          } catch (_) {}
+        }
+
         final incomingMsg = ChatMessage(
           id: id,
           chatOnion: sender,
           senderOnion: sender,
           recipientOnion: recipient,
-          content: content,
+          content: isDeleted ? '' : content,
           timestamp: timestamp,
           isOutgoing: false,
           status: MessageStatus.delivered,
+          mediaPath: savedMediaPath,
+          messageType: messageType,
+          isDeleted: isDeleted,
         );
 
+        MessageStatus confirmedStatus = MessageStatus.delivered;
         if (onMessageReceived != null) {
-          await onMessageReceived!(incomingMsg, senderNick);
+          final res = await onMessageReceived!(incomingMsg, senderNick);
+          if (res != null) {
+            confirmedStatus = res;
+          }
         }
 
         _sendJsonResponse(request, HttpStatus.ok, {
-          'status': 'delivered',
+          'status': confirmedStatus.name,
           'id': id,
           'timestamp': DateTime.now().toIso8601String(),
         });
+        return;
+      }
+
+      if (request.method == 'POST' && path == '/api/v1/delete') {
+        final bodyStr = await utf8.decoder.bind(request).join();
+        final Map<String, dynamic> data = jsonDecode(bodyStr);
+
+        final id = data['id'] as String?;
+        final sender = (data['sender'] as String?)?.trim();
+
+        if (id != null && sender != null && onMessageDeleted != null) {
+          await onMessageDeleted!(id, sender);
+        }
+
+        _sendJsonResponse(request, HttpStatus.ok, {'status': 'ok'});
         return;
       }
 
@@ -91,12 +133,19 @@ class PeerServer {
         final bodyStr = await utf8.decoder.bind(request).join();
         final Map<String, dynamic> data = jsonDecode(bodyStr);
 
-        final id = data['id'] as String;
         final statusStr = data['status'] as String? ?? 'delivered';
         final status = MessageStatus.fromString(statusStr);
 
-        if (onReceiptReceived != null) {
+        final id = data['id'] as String?;
+        final ids = (data['ids'] as List<dynamic>?)?.map((e) => e.toString()).toList();
+
+        if (id != null && onReceiptReceived != null) {
           await onReceiptReceived!(id, status);
+        }
+        if (ids != null && onReceiptReceived != null) {
+          for (final singleId in ids) {
+            await onReceiptReceived!(singleId, status);
+          }
         }
 
         _sendJsonResponse(request, HttpStatus.ok, {'status': 'ok'});
@@ -114,6 +163,7 @@ class PeerServer {
     try {
       request.response.statusCode = statusCode;
       request.response.headers.contentType = ContentType.json;
+      request.response.headers.set(HttpHeaders.connectionHeader, 'keep-alive');
       final jsonBytes = utf8.encode(jsonEncode(body));
       request.response.contentLength = jsonBytes.length;
       request.response.add(jsonBytes);

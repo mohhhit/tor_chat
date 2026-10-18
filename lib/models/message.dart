@@ -14,6 +14,21 @@ enum MessageStatus {
   }
 }
 
+enum MessageType {
+  text,
+  image;
+
+  String get name => toString().split('.').last;
+
+  static MessageType fromString(String? value) {
+    if (value == null) return MessageType.text;
+    return MessageType.values.firstWhere(
+      (e) => e.name.toLowerCase() == value.toLowerCase(),
+      orElse: () => MessageType.text,
+    );
+  }
+}
+
 class ChatMessage {
   final String id;
   final String chatOnion;
@@ -23,6 +38,9 @@ class ChatMessage {
   final DateTime timestamp;
   final bool isOutgoing;
   final MessageStatus status;
+  final String? mediaPath;
+  final MessageType messageType;
+  final bool isDeleted;
 
   ChatMessage({
     required this.id,
@@ -33,6 +51,9 @@ class ChatMessage {
     required this.timestamp,
     required this.isOutgoing,
     this.status = MessageStatus.sending,
+    this.mediaPath,
+    this.messageType = MessageType.text,
+    this.isDeleted = false,
   });
 
   Map<String, dynamic> toMap() => {
@@ -44,6 +65,9 @@ class ChatMessage {
         'timestamp': timestamp.toIso8601String(),
         'is_outgoing': isOutgoing ? 1 : 0,
         'status': status.name,
+        'media_path': mediaPath,
+        'message_type': messageType.name,
+        'is_deleted': isDeleted ? 1 : 0,
       };
 
   factory ChatMessage.fromMap(Map<String, dynamic> map) {
@@ -56,6 +80,9 @@ class ChatMessage {
       timestamp: DateTime.parse(map['timestamp'] as String),
       isOutgoing: (map['is_outgoing'] as int) == 1,
       status: MessageStatus.fromString(map['status'] as String? ?? 'sending'),
+      mediaPath: map['media_path'] as String?,
+      messageType: MessageType.fromString(map['message_type'] as String?),
+      isDeleted: (map['is_deleted'] as int? ?? 0) == 1,
     );
   }
 
@@ -65,6 +92,8 @@ class ChatMessage {
         'recipient': recipientOnion,
         'content': content,
         'timestamp': timestamp.toIso8601String(),
+        'type': messageType.name,
+        'is_deleted': isDeleted ? 1 : 0,
       };
 
   ChatMessage copyWith({
@@ -76,6 +105,9 @@ class ChatMessage {
     DateTime? timestamp,
     bool? isOutgoing,
     MessageStatus? status,
+    String? mediaPath,
+    MessageType? messageType,
+    bool? isDeleted,
   }) {
     return ChatMessage(
       id: id ?? this.id,
@@ -86,6 +118,9 @@ class ChatMessage {
       timestamp: timestamp ?? this.timestamp,
       isOutgoing: isOutgoing ?? this.isOutgoing,
       status: status ?? this.status,
+      mediaPath: mediaPath ?? this.mediaPath,
+      messageType: messageType ?? this.messageType,
+      isDeleted: isDeleted ?? this.isDeleted,
     );
   }
 }

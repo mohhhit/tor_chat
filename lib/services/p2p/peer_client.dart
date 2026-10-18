@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import '../../models/message.dart';
 import '../tor/socks5_client.dart';
 
@@ -23,21 +24,32 @@ class PeerClient {
   PeerClient({required this.socks5});
 
   /// Sends a chat message to the remote peer's onion address
-  Future<bool> sendMessage({
+  /// Returns confirmed [MessageStatus] on success (read or delivered)
+  Future<MessageStatus> sendMessage({
     required String peerOnion,
     required ChatMessage message,
     required String myNickname,
     Duration timeout = const Duration(seconds: 40),
   }) async {
     try {
-      final payload = {
+      final Map<String, dynamic> payload = {
         'id': message.id,
         'sender': message.senderOnion,
         'recipient': message.recipientOnion,
-        'content': message.content,
+        'content': message.isDeleted ? '' : message.content,
         'nickname': myNickname,
         'timestamp': message.timestamp.toIso8601String(),
+        'type': message.messageType.name,
+        'is_deleted': message.isDeleted ? 1 : 0,
       };
+
+      if (!message.isDeleted && message.messageType == MessageType.image && message.mediaPath != null) {
+        final file = File(message.mediaPath!);
+        if (await file.exists()) {
+          final bytes = await file.readAsBytes();
+          payload['media_data'] = base64Encode(bytes);
+        }
+      }
 
       final response = await socks5.sendHttpRequest(
         method: 'POST',
@@ -50,14 +62,20 @@ class PeerClient {
       if (response.isSuccess) {
         try {
           final resData = jsonDecode(response.body);
-          return resData['status'] == 'delivered';
+          if (resData is Map && resData['status'] != null) {
+            final returnedStatus = MessageStatus.fromString(resData['status'].toString());
+            if (returnedStatus == MessageStatus.read) {
+              return MessageStatus.read;
+            }
+          }
+          return MessageStatus.delivered;
         } catch (_) {
-          return true;
+          return MessageStatus.delivered;
         }
       }
-      return false;
+      throw Exception('Peer returned HTTP ${response.statusCode}: ${response.body}');
     } catch (e) {
-      return false;
+      rethrow;
     }
   }
 
@@ -95,26 +113,56 @@ class PeerClient {
   /// Sends a read / delivery confirmation receipt to the remote peer
   Future<bool> sendReceipt({
     required String peerOnion,
-    required String messageId,
+    String? messageId,
+    List<String>? messageIds,
     required MessageStatus status,
+    Duration timeout = const Duration(seconds: 25),
   }) async {
     try {
-      final payload = {
-        'id': messageId,
+      final Map<String, dynamic> payload = {
         'status': status.name,
       };
+      if (messageId != null) payload['id'] = messageId;
+      if (messageIds != null && messageIds.isNotEmpty) payload['ids'] = messageIds;
 
       final response = await socks5.sendHttpRequest(
         method: 'POST',
         onionAddress: peerOnion,
         path: '/api/v1/receipt',
         body: jsonEncode(payload),
-        timeout: const Duration(seconds: 25),
+        timeout: timeout,
       );
       return response.isSuccess;
     } catch (_) {
       return false;
     }
   }
+
+  /// Sends a delete-for-everyone event to the remote peer
+  Future<bool> sendDeleteMessage({
+    required String peerOnion,
+    required String messageId,
+    required String myOnion,
+    Duration timeout = const Duration(seconds: 25),
+  }) async {
+    try {
+      final response = await socks5.sendHttpRequest(
+        method: 'POST',
+        onionAddress: peerOnion,
+        path: '/api/v1/delete',
+        body: jsonEncode({
+          'id': messageId,
+          'sender': myOnion,
+        }),
+        timeout: timeout,
+      );
+      return response.isSuccess;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Pre-warms connection to peer in background
+  Future<void> prewarmPeer(String peerOnion) => socks5.prewarm(peerOnion);
 }
 

@@ -49,5 +49,5 @@ app.*.map.json
 
 # Local Tor Chat Vault & Runtime Tor Data
 *.db
-tor_data/
-tor_chat/
+/tor_data/
+/tor_chat/

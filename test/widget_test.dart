@@ -64,5 +64,62 @@ void main() {
       final delivered = msg.copyWith(status: MessageStatus.delivered);
       expect(delivered.status, MessageStatus.delivered);
     });
+
+    test('ChatMessage image serialization and mediaPath preservation', () {
+      final imgMsg = ChatMessage(
+        id: 'img-uuid-5678',
+        chatOnion: 'target.onion',
+        senderOnion: 'sender.onion',
+        recipientOnion: 'target.onion',
+        content: 'Check this out!',
+        timestamp: DateTime(2026, 10, 18, 12, 5, 0),
+        isOutgoing: true,
+        status: MessageStatus.sending,
+        mediaPath: '/path/to/media/photo.jpg',
+        messageType: MessageType.image,
+      );
+
+      final map = imgMsg.toMap();
+      expect(map['media_path'], '/path/to/media/photo.jpg');
+      expect(map['message_type'], 'image');
+
+      final restored = ChatMessage.fromMap(map);
+      expect(restored.mediaPath, '/path/to/media/photo.jpg');
+      expect(restored.messageType, MessageType.image);
+      expect(restored.content, 'Check this out!');
+
+      final payload = imgMsg.toNetworkPayload();
+      expect(payload['type'], 'image');
+    });
+
+    test('ChatMessage deletion status and payload serialization', () {
+      final msg = ChatMessage(
+        id: 'msg-del-9999',
+        chatOnion: 'target.onion',
+        senderOnion: 'sender.onion',
+        recipientOnion: 'target.onion',
+        content: 'Sensitive message to delete',
+        timestamp: DateTime(2026, 10, 18, 12, 10, 0),
+        isOutgoing: true,
+        status: MessageStatus.delivered,
+        isDeleted: false,
+      );
+
+      final deletedMsg = msg.copyWith(
+        isDeleted: true,
+        content: '',
+      );
+
+      final map = deletedMsg.toMap();
+      expect(map['is_deleted'], 1);
+      expect(map['content'], '');
+
+      final restored = ChatMessage.fromMap(map);
+      expect(restored.isDeleted, isTrue);
+      expect(restored.content, '');
+
+      final payload = deletedMsg.toNetworkPayload();
+      expect(payload['is_deleted'], 1);
+    });
   });
 }

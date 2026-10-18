@@ -21,6 +21,7 @@ class TorProcessManager {
   Stream<String> get logStream => _logController.stream;
   List<String> get logs => List.unmodifiable(_recentLogs);
   bool get isRunning => _torProcess != null;
+  void addExternalLog(String line) => _addLog(line);
 
   void _updateStatus(TorStatus newStatus) {
     _status = newStatus;
@@ -149,6 +150,11 @@ class TorProcessManager {
         bootstrapProgress: 100,
         bootstrapSummary: 'Connected to existing Tor daemon',
       ));
+      if (Platform.isAndroid) {
+        try {
+          await _nativeChannel.invokeMethod('startBackgroundService');
+        } catch (_) {}
+      }
       return true;
     } catch (_) {
       // No existing daemon, proceed to launch bundled Tor
@@ -226,7 +232,7 @@ class TorProcessManager {
       });
 
       // Wait for bootstrap or timeout
-      return await _bootstrapCompleter!.future.timeout(
+      final started = await _bootstrapCompleter!.future.timeout(
         timeout,
         onTimeout: () {
           if (_status.bootstrapProgress > 0) {
@@ -237,6 +243,14 @@ class TorProcessManager {
           throw TimeoutException('Tor bootstrap timed out after ${timeout.inSeconds}s');
         },
       );
+
+      if (started && Platform.isAndroid) {
+        try {
+          await _nativeChannel.invokeMethod('startBackgroundService');
+        } catch (_) {}
+      }
+
+      return started;
     } catch (e) {
       _updateStatus(_status.copyWith(
         state: TorConnectionState.error,
@@ -250,6 +264,11 @@ class TorProcessManager {
 
   /// Stops the running Tor process gracefully
   Future<void> stopTor() async {
+    if (Platform.isAndroid) {
+      try {
+        await _nativeChannel.invokeMethod('stopBackgroundService');
+      } catch (_) {}
+    }
     if (_torProcess != null) {
       _addLog('[notice] Stopping Tor process...');
       _torProcess!.kill(ProcessSignal.sigterm);

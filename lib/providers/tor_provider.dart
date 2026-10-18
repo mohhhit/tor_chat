@@ -9,12 +9,27 @@ class TorProvider extends ChangeNotifier {
   StreamSubscription<TorStatus>? _statusSub;
   StreamSubscription<String>? _logSub;
 
+  bool _isBatteryIgnored = true;
+  bool get isBatteryIgnored => _isBatteryIgnored;
+
   TorProvider() {
     _status = _coordinator.torStatus;
     _statusSub = _coordinator.torStatusStream.listen((newStatus) {
       _status = newStatus;
       notifyListeners();
     });
+    checkBatteryOptimization();
+  }
+
+  Future<void> checkBatteryOptimization() async {
+    _isBatteryIgnored = await _coordinator.isBatteryOptimizationIgnored();
+    notifyListeners();
+  }
+
+  Future<void> requestIgnoreBatteryOptimization() async {
+    await _coordinator.requestIgnoreBatteryOptimization();
+    await Future.delayed(const Duration(seconds: 1));
+    await checkBatteryOptimization();
   }
 
   TorStatus get status => _status;

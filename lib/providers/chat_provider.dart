@@ -18,6 +18,8 @@ class ChatProvider extends ChangeNotifier {
 
   StreamSubscription<ChatMessage>? _incomingMsgSub;
   StreamSubscription<Map<String, dynamic>>? _receiptSub;
+  StreamSubscription<String>? _chatSelectionSub;
+  StreamSubscription<Map<String, String>>? _messageDeletedSub;
 
   ChatProvider() {
     _init();
@@ -29,13 +31,21 @@ class ChatProvider extends ChangeNotifier {
   bool get isLoading => _isLoading;
   Map<String, PeerPingResult> get pingCache => _pingCache;
 
+  bool _isSameOnion(String a, String b) {
+    return a.trim().toLowerCase() == b.trim().toLowerCase();
+  }
+
   void _init() {
     loadContacts();
 
     _incomingMsgSub = _coordinator.incomingMessages.listen((msg) async {
-      // If the incoming message belongs to currently opened chat
-      if (_selectedContact != null && _selectedContact!.onionAddress == msg.chatOnion) {
-        _activeMessages.add(msg);
+      final isCurrentChat = _selectedContact != null &&
+          _isSameOnion(_selectedContact!.onionAddress, msg.chatOnion);
+
+      if (isCurrentChat) {
+        if (!_activeMessages.any((m) => m.id == msg.id)) {
+          _activeMessages.add(msg);
+        }
         await _db.clearUnread(msg.chatOnion);
       }
       await loadContacts();
@@ -48,9 +58,46 @@ class ChatProvider extends ChangeNotifier {
 
       final index = _activeMessages.indexWhere((m) => m.id == msgId);
       if (index != -1) {
+        final current = _activeMessages[index].status;
+        if (current == MessageStatus.read && status != MessageStatus.read) {
+          return;
+        }
+        if (current == MessageStatus.delivered && status == MessageStatus.sending) {
+          return;
+        }
         _activeMessages[index] = _activeMessages[index].copyWith(status: status);
         notifyListeners();
       }
+    });
+
+    _chatSelectionSub = _coordinator.chatSelectionRequests.listen((chatOnion) async {
+      await loadContacts();
+      final contact = _contacts.cast<Contact?>().firstWhere(
+        (c) => c != null && _isSameOnion(c.onionAddress, chatOnion),
+        orElse: () => null,
+      );
+      if (contact != null) {
+        await selectChat(contact);
+      } else {
+        final dbContact = await _db.getContact(chatOnion);
+        if (dbContact != null) {
+          await selectChat(dbContact);
+        }
+      }
+    });
+
+    _messageDeletedSub = _coordinator.messageDeletions.listen((deletion) async {
+      final msgId = deletion['id'];
+      final index = _activeMessages.indexWhere((m) => m.id == msgId);
+      if (index != -1) {
+        _activeMessages[index] = _activeMessages[index].copyWith(
+          isDeleted: true,
+          content: '',
+          mediaPath: null,
+        );
+      }
+      await loadContacts();
+      notifyListeners();
     });
   }
 
@@ -61,13 +108,39 @@ class ChatProvider extends ChangeNotifier {
 
   Future<void> selectChat(Contact? contact) async {
     _selectedContact = contact;
+    _coordinator.activeChatOnion = contact?.onionAddress;
+
     if (contact != null) {
+      _coordinator.prewarmPeerConnection(contact.onionAddress);
+
+      // Fetch unread incoming message IDs to send read receipt to peer
+      final unreadIds = await _db.getUnreadIncomingMessageIds(contact.onionAddress);
+
+      // Mark locally as read and clear unread count
+      await _db.markIncomingMessagesAsRead(contact.onionAddress);
       await _db.clearUnread(contact.onionAddress);
       await loadMessages(contact.onionAddress);
       await loadContacts();
+
+      // Dispatch read receipts to remote peer
+      if (unreadIds.isNotEmpty) {
+        _coordinator.sendReadReceipts(
+          peerOnion: contact.onionAddress,
+          messageIds: unreadIds,
+        );
+      }
     } else {
       _activeMessages = [];
       notifyListeners();
+    }
+  }
+
+  /// Refreshes current active chat conversation and clears unread when app/window regains focus
+  Future<void> refreshActiveChat() async {
+    if (_selectedContact != null) {
+      await selectChat(_selectedContact);
+    } else {
+      await loadContacts();
     }
   }
 
@@ -85,6 +158,20 @@ class ChatProvider extends ChangeNotifier {
     final sent = await _coordinator.sendMessage(
       recipientOnion: _selectedContact!.onionAddress,
       content: content.trim(),
+    );
+
+    _activeMessages.add(sent);
+    await loadContacts();
+    notifyListeners();
+  }
+
+  Future<void> sendImage(String imagePath, {String caption = ''}) async {
+    if (_selectedContact == null) return;
+
+    final sent = await _coordinator.sendImageMessage(
+      recipientOnion: _selectedContact!.onionAddress,
+      originalImagePath: imagePath,
+      caption: caption,
     );
 
     _activeMessages.add(sent);
@@ -117,6 +204,7 @@ class ChatProvider extends ChangeNotifier {
     await _db.deleteContact(onionAddress);
     if (_selectedContact?.onionAddress == onionAddress) {
       _selectedContact = null;
+      _coordinator.activeChatOnion = null;
       _activeMessages = [];
     }
     await loadContacts();
@@ -129,10 +217,33 @@ class ChatProvider extends ChangeNotifier {
     return res;
   }
 
+  Future<void> deleteMessageForMe(ChatMessage message) async {
+    await _coordinator.deleteMessageForMe(message);
+    _activeMessages.removeWhere((m) => m.id == message.id);
+    await loadContacts();
+    notifyListeners();
+  }
+
+  Future<void> deleteMessageForEveryone(ChatMessage message) async {
+    await _coordinator.deleteMessageForEveryone(message);
+    final index = _activeMessages.indexWhere((m) => m.id == message.id);
+    if (index != -1) {
+      _activeMessages[index] = _activeMessages[index].copyWith(
+        isDeleted: true,
+        content: '',
+        mediaPath: null,
+      );
+    }
+    await loadContacts();
+    notifyListeners();
+  }
+
   @override
   void dispose() {
     _incomingMsgSub?.cancel();
     _receiptSub?.cancel();
+    _chatSelectionSub?.cancel();
+    _messageDeletedSub?.cancel();
     super.dispose();
   }
 }

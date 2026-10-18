@@ -1,3 +1,4 @@
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
@@ -140,7 +141,55 @@ class _TorSettingsScreenState extends State<TorSettingsScreen> {
                 ),
               ),
             ),
-            const SizedBox(height: 16),
+            const SizedBox(height: 12),
+
+            if (Platform.isAndroid) ...[
+              Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(14),
+                  child: Row(
+                    children: [
+                      Icon(
+                        tor.isBatteryIgnored ? Icons.check_circle_outline : Icons.battery_alert_outlined,
+                        color: tor.isBatteryIgnored ? AppTheme.onlineGreen : AppTheme.warningAmber,
+                        size: 28,
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              tor.isBatteryIgnored ? 'Background Activity: Unrestricted' : 'Background Activity: Restricted',
+                              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                            ),
+                            const SizedBox(height: 2),
+                            Text(
+                              tor.isBatteryIgnored
+                                  ? 'App will receive peer messages 24/7 even when closed.'
+                                  : 'Allow unrestricted battery to prevent Android from killing Tor when swiped from recents.',
+                              style: const TextStyle(fontSize: 11, color: AppTheme.textSecondary),
+                            ),
+                          ],
+                        ),
+                      ),
+                      if (!tor.isBatteryIgnored) ...[
+                        const SizedBox(width: 8),
+                        FilledButton(
+                          style: FilledButton.styleFrom(
+                            backgroundColor: AppTheme.torPurple,
+                            visualDensity: VisualDensity.compact,
+                          ),
+                          onPressed: () => tor.requestIgnoreBatteryOptimization(),
+                          child: const Text('Allow'),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 12),
+            ],
 
             // Live Log Console Header
             Row(

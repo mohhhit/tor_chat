@@ -13,6 +13,17 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
     CreateAndAttachConsole();
   }
 
+  // Prevent multiple instances from running simultaneously
+  HANDLE mutex = ::CreateMutex(nullptr, TRUE, L"TorChatP2PSingleInstanceMutex");
+  if (::GetLastError() == ERROR_ALREADY_EXISTS) {
+    HWND existing_window = ::FindWindow(L"FLUTTER_RUNNER_WIN32_WINDOW", nullptr);
+    if (existing_window) {
+      ::ShowWindow(existing_window, SW_RESTORE);
+      ::SetForegroundWindow(existing_window);
+    }
+    return EXIT_SUCCESS;
+  }
+
   // Initialize COM, so that it is available for use in the library and/or
   // plugins.
   ::CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -36,6 +47,11 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
   while (::GetMessage(&msg, nullptr, 0, 0)) {
     ::TranslateMessage(&msg);
     ::DispatchMessage(&msg);
+  }
+
+  if (mutex) {
+    ::ReleaseMutex(mutex);
+    ::CloseHandle(mutex);
   }
 
   ::CoUninitialize();

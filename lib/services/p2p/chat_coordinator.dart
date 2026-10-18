@@ -1,5 +1,11 @@
 import 'dart:async';
+import 'dart:io';
+import 'package:flutter/services.dart';
+import 'package:local_notifier/local_notifier.dart';
+import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
 import 'package:uuid/uuid.dart';
+import 'package:window_manager/window_manager.dart';
 import '../../models/contact.dart';
 import '../../models/identity.dart';
 import '../../models/message.dart';
@@ -34,6 +40,10 @@ class ChatCoordinator {
       StreamController<ChatMessage>.broadcast();
   final StreamController<Map<String, dynamic>> _receiptController =
       StreamController<Map<String, dynamic>>.broadcast();
+  final StreamController<String> _chatSelectionController =
+      StreamController<String>.broadcast();
+  final StreamController<Map<String, String>> _messageDeletedController =
+      StreamController<Map<String, String>>.broadcast();
 
   ChatCoordinator._init() {
     _socks5 = Socks5Client(proxyHost: '127.0.0.1', proxyPort: _socksPort);
@@ -46,8 +56,56 @@ class ChatCoordinator {
   UserIdentity? get activeIdentity => _activeIdentity;
   Stream<ChatMessage> get incomingMessages => _incomingMessageController.stream;
   Stream<Map<String, dynamic>> get receipts => _receiptController.stream;
+  Stream<String> get chatSelectionRequests => _chatSelectionController.stream;
+  Stream<Map<String, String>> get messageDeletions => _messageDeletedController.stream;
   Stream<TorStatus> get torStatusStream => _torManager.statusStream;
   TorStatus get torStatus => _torManager.status;
+
+  String? activeChatOnion;
+  bool isAppInForeground = true;
+  bool isWindowVisible = true;
+  bool isWindowFocused = true;
+
+  /// Determines if the user is actively viewing this specific chat right now on screen
+  bool isViewingChat(String chatOnion) {
+    if (activeChatOnion == null) return false;
+    if (activeChatOnion!.trim().toLowerCase() != chatOnion.trim().toLowerCase()) return false;
+    if (!isAppInForeground) return false;
+    if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
+      if (!isWindowVisible || !isWindowFocused) return false;
+    }
+    return true;
+  }
+
+  void requestSelectChat(String chatOnion) => _chatSelectionController.add(chatOnion);
+
+  /// Queues and dispatches read receipts to the peer for one or more message IDs with SQLite persistence
+  Future<void> sendReadReceipts({
+    required String peerOnion,
+    required List<String> messageIds,
+  }) async {
+    if (messageIds.isEmpty) return;
+    await _db.addPendingReadReceipts(peerOnion, messageIds);
+    unawaited(_sendReceiptsDirectly(peerOnion, messageIds));
+    _processOutbox(targetPeer: peerOnion);
+  }
+
+  Future<void> _sendReceiptsDirectly(String peerOnion, List<String> messageIds) async {
+    try {
+      final ok = await _peerClient.sendReceipt(
+        peerOnion: peerOnion,
+        messageIds: messageIds,
+        status: MessageStatus.read,
+        timeout: const Duration(seconds: 25),
+      );
+      if (ok) {
+        await _db.removePendingReadReceipts(messageIds);
+        _torManager.addExternalLog('[notice] Delivered ${messageIds.length} read receipts directly to $peerOnion');
+      }
+    } catch (_) {
+      // Ignored: _processPendingReceipts in outbox worker will retry automatically
+    }
+  }
 
   /// Full startup flow: launches Tor, connects Control Port, sets up Onion Service & P2P Server
   Future<void> initialize({String? customTorPath}) async {
@@ -69,9 +127,9 @@ class ChatCoordinator {
     try {
       await _torControl.connect();
       await _torControl.authenticate();
+      _torManager.addExternalLog('[notice] Connected and authenticated with Tor Control Port');
     } catch (e) {
-      // Could not connect to control port
-      return;
+      _torManager.addExternalLog('[warn] Tor Control Port connection: $e');
     }
 
     // 4. Register or restore Onion Service
@@ -79,6 +137,21 @@ class ChatCoordinator {
 
     // 5. Start incoming P2P Server
     await _startPeerServer();
+
+    // 6. Start Outbox background retry worker
+    _startOutboxWorker();
+
+    // 7. Listen for Android native notifications click
+    if (Platform.isAndroid) {
+      const MethodChannel('com.onionchat.tor_chat/native').setMethodCallHandler((call) async {
+        if (call.method == 'onSelectChat') {
+          final chatOnion = call.arguments as String?;
+          if (chatOnion != null && chatOnion.isNotEmpty) {
+            _chatSelectionController.add(chatOnion);
+          }
+        }
+      });
+    }
   }
 
   Future<void> _setupOnionService() async {
@@ -107,8 +180,13 @@ class ChatCoordinator {
         );
         await _db.saveIdentity(_activeIdentity!);
       }
+      _torManager.addExternalLog('[notice] Onion service registered: $fullAddress');
     } catch (e) {
-      // Onion service setup error
+      if (e.toString().contains('550') || e.toString().contains('collision')) {
+        _torManager.addExternalLog('[notice] Onion service already active on Tor daemon.');
+      } else {
+        _torManager.addExternalLog('[error] Failed to register Onion Service: $e');
+      }
     }
   }
 
@@ -124,6 +202,17 @@ class ChatCoordinator {
     );
 
     _peerServer!.onMessageReceived = (msg, senderNick) async {
+      final isCurrentlyViewingChat = isViewingChat(msg.chatOnion);
+
+      final initialStatus = isCurrentlyViewingChat ? MessageStatus.read : MessageStatus.delivered;
+      final msgToSave = msg.copyWith(status: initialStatus);
+
+      final summaryText = msg.isDeleted
+          ? (msg.isOutgoing ? '🚫 You deleted this message' : '🚫 This message was deleted')
+          : (msg.messageType == MessageType.image
+              ? (msg.content.isNotEmpty ? '📷 ${msg.content}' : '📷 Photo')
+              : msg.content);
+
       // Auto-save unknown contact
       final existingContact = await _db.getContact(msg.chatOnion);
       if (existingContact == null) {
@@ -131,31 +220,99 @@ class ChatCoordinator {
           onionAddress: msg.chatOnion,
           nickname: senderNick?.isNotEmpty == true ? senderNick! : 'Peer_${msg.chatOnion.substring(0, 6)}',
           lastSeen: DateTime.now(),
-          lastMessage: msg.content,
+          lastMessage: summaryText,
           lastMessageTimestamp: msg.timestamp,
-          unreadCount: 1,
+          unreadCount: isCurrentlyViewingChat ? 0 : 1,
         );
         await _db.saveContact(newContact);
       } else {
         await _db.updateContactLastMessage(
           onionAddress: msg.chatOnion,
-          lastMessage: msg.content,
+          lastMessage: summaryText,
           timestamp: msg.timestamp,
         );
-        await _db.incrementUnread(msg.chatOnion);
+        if (!isCurrentlyViewingChat) {
+          await _db.incrementUnread(msg.chatOnion);
+        }
       }
 
       // Save message
-      await _db.insertMessage(msg);
-      _incomingMessageController.add(msg);
+      await _db.insertMessage(msgToSave);
+      _incomingMessageController.add(msgToSave);
+
+      // Only trigger system notifications if the user is NOT actively viewing this chat!
+      if (!isCurrentlyViewingChat) {
+        if (Platform.isAndroid) {
+          try {
+            const MethodChannel('com.onionchat.tor_chat/native').invokeMethod(
+              'showIncomingNotification',
+              {
+                'sender': senderNick?.isNotEmpty == true ? senderNick : 'Peer (${msg.chatOnion.substring(0, 8)}...)',
+                'content': summaryText,
+                'chatOnion': msg.chatOnion,
+              },
+            );
+          } catch (_) {}
+        } else if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
+          try {
+            final notification = LocalNotification(
+              identifier: '${msg.id}_${DateTime.now().millisecondsSinceEpoch}',
+              title: senderNick?.isNotEmpty == true ? senderNick! : 'Peer (${msg.chatOnion.substring(0, 8)}...)',
+              body: summaryText,
+            );
+            notification.onClick = () async {
+              await windowManager.show();
+              await windowManager.focus();
+              isWindowVisible = true;
+              isWindowFocused = true;
+              _chatSelectionController.add(msg.chatOnion);
+            };
+            await notification.show();
+          } catch (e) {
+            _torManager.addExternalLog('[warn] Desktop notification error: $e');
+          }
+        }
+      }
+
+      // Pre-warm return circuit and flush queued outgoing messages
+      _peerClient.prewarmPeer(msg.senderOnion);
+      _processOutbox(targetPeer: msg.senderOnion);
+
+      return initialStatus;
     };
 
     _peerServer!.onReceiptReceived = (msgId, status) async {
-      await _db.updateMessageStatus(msgId, status);
-      _receiptController.add({'id': msgId, 'status': status});
+      final updated = await _db.updateMessageStatus(msgId, status);
+      if (updated) {
+        _receiptController.add({'id': msgId, 'status': status});
+      }
+    };
+
+    _peerServer!.onMessageDeleted = (msgId, senderOnion) async {
+      await _db.markMessageDeletedForEveryone(msgId);
+      _messageDeletedController.add({'id': msgId, 'chatOnion': senderOnion});
+      _torManager.addExternalLog('[notice] Peer $senderOnion deleted message $msgId for everyone');
     };
 
     await _peerServer!.start();
+  }
+
+  Timer? _outboxTimer;
+  bool _isProcessingOutbox = false;
+  bool _needsAnotherRun = false;
+
+  void _startOutboxWorker() {
+    _outboxTimer?.cancel();
+    _outboxTimer = Timer.periodic(const Duration(seconds: 8), (_) {
+      _processOutbox();
+    });
+    // Run immediately on launch
+    _processOutbox();
+  }
+
+  /// Pre-warms the Tor connection to the selected peer in the background
+  void prewarmPeerConnection(String peerOnion) {
+    _peerClient.prewarmPeer(peerOnion);
   }
 
   /// Sends a message peer-to-peer over the Tor network
@@ -190,26 +347,251 @@ class ChatCoordinator {
       timestamp: now,
     );
 
-    // Dispatch over Tor in background
-    _dispatchOutgoingMessage(msg);
+    // Trigger Outbox processing immediately
+    _processOutbox(targetPeer: cleanRecipient);
 
     return msg;
   }
 
-  void _dispatchOutgoingMessage(ChatMessage msg) async {
-    try {
-      final success = await _peerClient.sendMessage(
-        peerOnion: msg.recipientOnion,
-        message: msg,
-        myNickname: _activeIdentity?.nickname ?? 'Anonymous',
-      );
+  /// Persistent media directory for sent/received photos
+  Future<Directory> getMediaDirectory() async {
+    final docsDir = await getApplicationDocumentsDirectory();
+    final mediaDir = Directory(p.join(docsDir.path, 'tor_chat', 'media'));
+    if (!await mediaDir.exists()) {
+      await mediaDir.create(recursive: true);
+    }
+    return mediaDir;
+  }
 
-      final newStatus = success ? MessageStatus.delivered : MessageStatus.failed;
-      await _db.updateMessageStatus(msg.id, newStatus);
-      _receiptController.add({'id': msg.id, 'status': newStatus});
+  /// Sends a photo peer-to-peer over the Tor network
+  Future<ChatMessage> sendImageMessage({
+    required String recipientOnion,
+    required String originalImagePath,
+    String caption = '',
+  }) async {
+    if (_activeIdentity == null) {
+      throw Exception('Identity not initialized');
+    }
+
+    final messageId = _uuid.v4();
+    final now = DateTime.now();
+    final cleanRecipient = recipientOnion.trim();
+
+    // Copy to persistent local media directory
+    final mediaDir = await getMediaDirectory();
+    final localCopy = File(p.join(mediaDir.path, '$messageId.jpg'));
+    await File(originalImagePath).copy(localCopy.path);
+
+    final summaryText = caption.trim().isNotEmpty ? '📷 ${caption.trim()}' : '📷 Photo';
+
+    final msg = ChatMessage(
+      id: messageId,
+      chatOnion: cleanRecipient,
+      senderOnion: _activeIdentity!.onionAddress,
+      recipientOnion: cleanRecipient,
+      content: caption.trim(),
+      timestamp: now,
+      isOutgoing: true,
+      status: MessageStatus.sending,
+      mediaPath: localCopy.path,
+      messageType: MessageType.image,
+    );
+
+    // Save message locally immediately
+    await _db.insertMessage(msg);
+    await _db.updateContactLastMessage(
+      onionAddress: cleanRecipient,
+      lastMessage: summaryText,
+      timestamp: now,
+    );
+
+    // Trigger Outbox processing immediately
+    _processOutbox(targetPeer: cleanRecipient);
+
+    return msg;
+  }
+
+  Future<void> _processOutbox({String? targetPeer}) async {
+    if (_isProcessingOutbox) {
+      _needsAnotherRun = true;
+      return;
+    }
+    _isProcessingOutbox = true;
+
+    try {
+      do {
+        _needsAnotherRun = false;
+        await _processPendingOutgoingMessages(targetPeer: targetPeer);
+        await _processPendingReceipts(targetPeer: targetPeer);
+        await _processPendingDeletes(targetPeer: targetPeer);
+      } while (_needsAnotherRun);
+    } finally {
+      _isProcessingOutbox = false;
+    }
+  }
+
+  Future<void> _processPendingOutgoingMessages({String? targetPeer}) async {
+    try {
+      final pending = await _db.getPendingOutgoingMessages();
+      if (pending.isEmpty) return;
+
+      final Map<String, List<ChatMessage>> byPeer = {};
+      for (final msg in pending) {
+        if (targetPeer != null && msg.recipientOnion != targetPeer) continue;
+        byPeer.putIfAbsent(msg.recipientOnion, () => []).add(msg);
+      }
+
+      if (byPeer.isEmpty) return;
+
+      for (final entry in byPeer.entries) {
+        final peerOnion = entry.key;
+        final messages = entry.value;
+
+        // If peer onion address is invalid, mark as failed permanently
+        if (!peerOnion.endsWith('.onion') || peerOnion.length < 20) {
+          for (final msg in messages) {
+            await _db.updateMessageStatus(msg.id, MessageStatus.failed);
+            _receiptController.add({'id': msg.id, 'status': MessageStatus.failed});
+          }
+          continue;
+        }
+
+        for (final msg in messages) {
+          try {
+            _torManager.addExternalLog('[notice] Outbox sending ${msg.id.substring(0, 8)} to $peerOnion...');
+            final confirmedStatus = await _peerClient.sendMessage(
+              peerOnion: peerOnion,
+              message: msg,
+              myNickname: _activeIdentity?.nickname ?? 'Anonymous',
+              timeout: const Duration(seconds: 30),
+            );
+
+            final updated = await _db.updateMessageStatus(msg.id, confirmedStatus);
+            if (updated) {
+              _receiptController.add({'id': msg.id, 'status': confirmedStatus});
+            }
+            _torManager.addExternalLog('[notice] Message ${msg.id.substring(0, 8)} confirmed: ${confirmedStatus.name}!');
+          } catch (e) {
+            _torManager.addExternalLog('[notice] Peer $peerOnion unreachable ($e). Kept in queue for infinite auto-retry.');
+            _socks5.invalidatePeer(peerOnion);
+            _torControl.signalNewNym();
+            // Do not mark failed; keep in sending so background worker retries infinitely
+            break;
+          }
+        }
+      }
+    } catch (e) {
+      _torManager.addExternalLog('[warn] Outbox error: $e');
+    }
+  }
+
+  Future<void> _processPendingReceipts({String? targetPeer}) async {
+    try {
+      final pendingReceipts = await _db.getPendingReadReceipts();
+      if (pendingReceipts.isEmpty) return;
+
+      for (final entry in pendingReceipts.entries) {
+        final peerOnion = entry.key;
+        final ids = entry.value;
+        if (targetPeer != null && peerOnion != targetPeer) continue;
+        if (ids.isEmpty) continue;
+
+        try {
+          final ok = await _peerClient.sendReceipt(
+            peerOnion: peerOnion,
+            messageIds: ids,
+            status: MessageStatus.read,
+            timeout: const Duration(seconds: 25),
+          );
+          if (ok) {
+            await _db.removePendingReadReceipts(ids);
+            _torManager.addExternalLog('[notice] Delivered ${ids.length} read receipts to $peerOnion');
+          } else {
+            _socks5.invalidatePeer(peerOnion);
+            _torControl.signalNewNym();
+          }
+        } catch (_) {
+          _socks5.invalidatePeer(peerOnion);
+          _torControl.signalNewNym();
+        }
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _processPendingDeletes({String? targetPeer}) async {
+    if (_activeIdentity == null) return;
+    try {
+      final pending = await _db.getPendingDeletes();
+      if (pending.isEmpty) return;
+
+      for (final entry in pending.entries) {
+        final peerOnion = entry.key;
+        final ids = entry.value;
+        if (targetPeer != null && peerOnion != targetPeer) continue;
+        if (ids.isEmpty) continue;
+
+        for (final msgId in ids) {
+          try {
+            final ok = await _peerClient.sendDeleteMessage(
+              peerOnion: peerOnion,
+              messageId: msgId,
+              myOnion: _activeIdentity!.onionAddress,
+              timeout: const Duration(seconds: 25),
+            );
+            if (ok) {
+              await _db.removePendingDelete(msgId);
+              _torManager.addExternalLog('[notice] Delivered queued delete for $msgId to $peerOnion');
+            } else {
+              _socks5.invalidatePeer(peerOnion);
+              _torControl.signalNewNym();
+            }
+          } catch (_) {
+            _socks5.invalidatePeer(peerOnion);
+            _torControl.signalNewNym();
+          }
+        }
+      }
+    } catch (_) {}
+  }
+
+  /// Deletes a message locally for the active user only (WhatsApp "Delete for me")
+  Future<void> deleteMessageForMe(ChatMessage message) async {
+    await _db.deleteMessageForMe(message.id);
+  }
+
+  /// Deletes a message for both sender and recipient (WhatsApp "Delete for everyone")
+  Future<void> deleteMessageForEveryone(ChatMessage message) async {
+    if (_activeIdentity == null) return;
+
+    // 1. Mark as deleted locally
+    await _db.markMessageDeletedForEveryone(message.id);
+    _messageDeletedController.add({'id': message.id, 'chatOnion': message.chatOnion});
+
+    // 2. Queue in pending_deletes for persistent guaranteed delivery
+    await _db.addPendingDelete(message.recipientOnion, message.id);
+
+    // 3. Immediately attempt direct delivery over Tor
+    unawaited(_sendDeleteDirectly(message.recipientOnion, message.id));
+
+    // 4. Trigger Outbox worker
+    _processOutbox(targetPeer: message.recipientOnion);
+  }
+
+  Future<void> _sendDeleteDirectly(String peerOnion, String messageId) async {
+    if (_activeIdentity == null) return;
+    try {
+      final ok = await _peerClient.sendDeleteMessage(
+        peerOnion: peerOnion,
+        messageId: messageId,
+        myOnion: _activeIdentity!.onionAddress,
+        timeout: const Duration(seconds: 25),
+      );
+      if (ok) {
+        await _db.removePendingDelete(messageId);
+        _torManager.addExternalLog('[notice] Delivered delete-for-everyone for $messageId directly to $peerOnion');
+      }
     } catch (_) {
-      await _db.updateMessageStatus(msg.id, MessageStatus.failed);
-      _receiptController.add({'id': msg.id, 'status': MessageStatus.failed});
+      // Ignored: _processPendingDeletes will retry in background
     }
   }
 
@@ -217,7 +599,7 @@ class ChatCoordinator {
   Future<void> retryMessage(ChatMessage msg) async {
     await _db.updateMessageStatus(msg.id, MessageStatus.sending);
     _receiptController.add({'id': msg.id, 'status': MessageStatus.sending});
-    _dispatchOutgoingMessage(msg);
+    _processOutbox(targetPeer: msg.recipientOnion);
   }
 
   /// Updates user profile nickname
@@ -279,11 +661,36 @@ class ChatCoordinator {
     return await _peerClient.pingPeer(peerOnion);
   }
 
+  /// Checks if battery optimizations are ignored on Android
+  Future<bool> isBatteryOptimizationIgnored() async {
+    if (!Platform.isAndroid) return true;
+    try {
+      final res = await const MethodChannel('com.onionchat.tor_chat/native')
+          .invokeMethod<bool>('isBatteryOptimizationIgnored');
+      return res ?? true;
+    } catch (_) {
+      return true;
+    }
+  }
+
+  /// Requests the system dialog to ignore battery optimizations on Android
+  Future<void> requestIgnoreBatteryOptimization() async {
+    if (!Platform.isAndroid) return;
+    try {
+      await const MethodChannel('com.onionchat.tor_chat/native')
+          .invokeMethod('requestIgnoreBatteryOptimization');
+    } catch (_) {}
+  }
+
   /// Shuts down all components cleanly
   Future<void> dispose() async {
     await _peerServer?.stop();
     await _torControl.disconnect();
     await _torManager.stopTor();
+    await _incomingMessageController.close();
+    await _receiptController.close();
+    await _chatSelectionController.close();
+    await _messageDeletedController.close();
   }
 }
 

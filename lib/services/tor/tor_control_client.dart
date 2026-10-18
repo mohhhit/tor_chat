@@ -77,7 +77,12 @@ class TorControlClient {
 
   Future<List<String>> sendCommand(String command, {Duration timeout = const Duration(seconds: 15)}) async {
     if (_socket == null) {
-      throw Exception('Tor Control socket not connected');
+      try {
+        await connect();
+        await authenticate();
+      } catch (e) {
+        throw Exception('Tor Control socket disconnected and auto-reconnect failed: $e');
+      }
     }
 
     while (_pendingCommandCompleter != null) {
@@ -156,7 +161,9 @@ class TorControlClient {
 
   /// Request a clean new Tor circuit (NEWNYM)
   Future<void> signalNewNym() async {
-    await sendCommand('SIGNAL NEWNYM');
+    try {
+      await sendCommand('SIGNAL NEWNYM');
+    } catch (_) {}
   }
 
   /// Get current bootstrap progress info
