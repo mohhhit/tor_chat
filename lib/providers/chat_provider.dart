@@ -200,6 +200,18 @@ class ChatProvider extends ChangeNotifier {
     await selectChat(newContact);
   }
 
+  Future<void> updateContactNickname(String onionAddress, String newNickname) async {
+    final cleanNick = newNickname.trim();
+    if (cleanNick.isEmpty) return;
+
+    await _db.updateContactNickname(onionAddress, cleanNick);
+    if (_selectedContact != null && _isSameOnion(_selectedContact!.onionAddress, onionAddress)) {
+      _selectedContact = _selectedContact!.copyWith(nickname: cleanNick);
+    }
+    await loadContacts();
+    notifyListeners();
+  }
+
   Future<void> deleteContact(String onionAddress) async {
     await _db.deleteContact(onionAddress);
     if (_selectedContact?.onionAddress == onionAddress) {

@@ -240,6 +240,10 @@ class ChatCoordinator {
       await _db.insertMessage(msgToSave);
       _incomingMessageController.add(msgToSave);
 
+      // Local display name: ALWAYS prioritize the user's custom saved contact nickname!
+      final displayName = existingContact?.nickname ??
+          (senderNick?.isNotEmpty == true ? senderNick! : 'Peer (${msg.chatOnion.substring(0, 8)}...)');
+
       // Only trigger system notifications if the user is NOT actively viewing this chat!
       if (!isCurrentlyViewingChat) {
         if (Platform.isAndroid) {
@@ -247,7 +251,7 @@ class ChatCoordinator {
             const MethodChannel('com.onionchat.tor_chat/native').invokeMethod(
               'showIncomingNotification',
               {
-                'sender': senderNick?.isNotEmpty == true ? senderNick : 'Peer (${msg.chatOnion.substring(0, 8)}...)',
+                'sender': displayName,
                 'content': summaryText,
                 'chatOnion': msg.chatOnion,
               },
@@ -257,7 +261,7 @@ class ChatCoordinator {
           try {
             final notification = LocalNotification(
               identifier: '${msg.id}_${DateTime.now().millisecondsSinceEpoch}',
-              title: senderNick?.isNotEmpty == true ? senderNick! : 'Peer (${msg.chatOnion.substring(0, 8)}...)',
+              title: displayName,
               body: summaryText,
             );
             notification.onClick = () async {

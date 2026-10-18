@@ -29,6 +29,35 @@ class _ChatDetailScreenState extends State<ChatDetailScreen> {
   @override
   void initState() {
     super.initState();
+    _focusNode.onKeyEvent = (node, event) {
+      if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
+        if (event is KeyDownEvent) {
+          final isEnter = event.logicalKey == LogicalKeyboardKey.enter ||
+              event.logicalKey == LogicalKeyboardKey.numpadEnter;
+          if (isEnter) {
+            if (HardwareKeyboard.instance.isShiftPressed) {
+              // Shift+Enter: Insert newline at current cursor position
+              final text = _textController.text;
+              final selection = _textController.selection;
+              final start = selection.start >= 0 ? selection.start : text.length;
+              final end = selection.end >= 0 ? selection.end : text.length;
+              final newText = text.replaceRange(start, end, '\n');
+              _textController.value = TextEditingValue(
+                text: newText,
+                selection: TextSelection.collapsed(offset: start + 1),
+              );
+              return KeyEventResult.handled;
+            } else {
+              // Plain Enter: Send message on Windows
+              _sendMessage();
+              return KeyEventResult.handled;
+            }
+          }
+        }
+      }
+      return KeyEventResult.ignored;
+    };
+
     WidgetsBinding.instance.addPostFrameCallback((_) {
       context.read<ChatProvider>().selectChat(widget.contact);
     });
@@ -254,7 +283,70 @@ class _ChatDetailScreenState extends State<ChatDetailScreen> {
     }
   }
 
-  void _confirmDelete() async {
+  void _showEditNicknameDialog(Contact contact) {
+    final nameController = TextEditingController(text: contact.nickname);
+    showDialog(
+      context: context,
+      builder: (dialogCtx) => AlertDialog(
+        backgroundColor: AppTheme.cardColor,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: const Row(
+          children: [
+            Icon(Icons.edit_note, color: AppTheme.torPurpleLight, size: 24),
+            SizedBox(width: 8),
+            Text('Edit Contact Name', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Set a local nickname for this contact. This name is private to your device only and is never broadcast or shared with others.',
+              style: TextStyle(fontSize: 13, color: AppTheme.textSecondary),
+            ),
+            const SizedBox(height: 16),
+            TextField(
+              controller: nameController,
+              autofocus: true,
+              decoration: const InputDecoration(
+                labelText: 'Contact Name',
+                hintText: 'e.g. Alice, Bob, Work',
+                prefixIcon: Icon(Icons.person, color: AppTheme.textSecondary, size: 20),
+              ),
+              textInputAction: TextInputAction.done,
+              onSubmitted: (_) {
+                final newName = nameController.text.trim();
+                if (newName.isNotEmpty) {
+                  Navigator.pop(dialogCtx);
+                  context.read<ChatProvider>().updateContactNickname(contact.onionAddress, newName);
+                }
+              },
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogCtx),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: AppTheme.torPurple),
+            onPressed: () {
+              final newName = nameController.text.trim();
+              if (newName.isNotEmpty) {
+                Navigator.pop(dialogCtx);
+                context.read<ChatProvider>().updateContactNickname(contact.onionAddress, newName);
+              }
+            },
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _confirmDelete(Contact contact) async {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (dialogCtx) => AlertDialog(
@@ -266,7 +358,7 @@ class _ChatDetailScreenState extends State<ChatDetailScreen> {
           ],
         ),
         content: Text(
-          'Are you sure you want to delete the conversation with "${widget.contact.nickname}" and all of its messages? This action cannot be undone.',
+          'Are you sure you want to delete the conversation with "${contact.nickname}" and all of its messages? This action cannot be undone.',
         ),
         actions: [
           TextButton(
@@ -361,8 +453,12 @@ class _ChatDetailScreenState extends State<ChatDetailScreen> {
   @override
   Widget build(BuildContext context) {
     final chatProvider = context.watch<ChatProvider>();
+    final contact = chatProvider.contacts.firstWhere(
+      (c) => c.onionAddress.toLowerCase() == widget.contact.onionAddress.toLowerCase(),
+      orElse: () => widget.contact,
+    );
     final messages = chatProvider.activeMessages;
-    final pingResult = chatProvider.pingCache[widget.contact.onionAddress];
+    final pingResult = chatProvider.pingCache[contact.onionAddress];
 
     if (messages.length != _lastMessageCount) {
       _lastMessageCount = messages.length;
@@ -383,86 +479,114 @@ class _ChatDetailScreenState extends State<ChatDetailScreen> {
       child: Scaffold(
         appBar: AppBar(
           titleSpacing: 0,
-          title: Row(
-            children: [
-              CircleAvatar(
-                radius: 18,
-                backgroundColor: AppTheme.torPurple,
-                child: Text(
-                  widget.contact.nickname.isNotEmpty ? widget.contact.nickname[0].toUpperCase() : 'P',
-                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: Colors.white),
-                ),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      widget.contact.nickname,
-                      style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-                      overflow: TextOverflow.ellipsis,
-                      maxLines: 1,
-                    ),
-                  InkWell(
-                    onTap: () {
-                      Clipboard.setData(ClipboardData(text: widget.contact.onionAddress));
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        const SnackBar(content: Text('Onion address copied!')),
-                      );
-                    },
+          title: InkWell(
+            onTap: () => _showEditNicknameDialog(contact),
+            borderRadius: BorderRadius.circular(8),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 4),
+              child: Row(
+                children: [
+                  CircleAvatar(
+                    radius: 18,
+                    backgroundColor: AppTheme.torPurple,
                     child: Text(
-                      widget.contact.onionAddress.length > 20
-                          ? '${widget.contact.onionAddress.substring(0, 16)}...onion'
-                          : widget.contact.onionAddress,
-                      style: const TextStyle(
-                        fontFamily: 'monospace',
-                        fontSize: 11,
-                        color: AppTheme.textSecondary,
-                      ),
+                      contact.nickname.isNotEmpty ? contact.nickname[0].toUpperCase() : 'P',
+                      style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: Colors.white),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Flexible(
+                              child: Text(
+                                contact.nickname,
+                                style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                                overflow: TextOverflow.ellipsis,
+                                maxLines: 1,
+                              ),
+                            ),
+                            const SizedBox(width: 6),
+                            const Icon(Icons.edit_outlined, size: 14, color: AppTheme.textSecondary),
+                          ],
+                        ),
+                        InkWell(
+                          onTap: () {
+                            Clipboard.setData(ClipboardData(text: contact.onionAddress));
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(content: Text('Onion address copied!')),
+                            );
+                          },
+                          child: Text(
+                            contact.onionAddress.length > 20
+                                ? '${contact.onionAddress.substring(0, 16)}...onion'
+                                : contact.onionAddress,
+                            style: const TextStyle(
+                              fontFamily: 'monospace',
+                              fontSize: 11,
+                              color: AppTheme.textSecondary,
+                            ),
+                          ),
+                        ),
+                      ],
                     ),
                   ),
                 ],
               ),
             ),
+          ),
+          actions: [
+            IconButton(
+              icon: _isPinging
+                  ? const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                    )
+                  : Icon(
+                      Icons.wifi_tethering,
+                      color: pingResult?.isOnline == true ? AppTheme.onlineGreen : AppTheme.textSecondary,
+                    ),
+              tooltip: 'Ping Peer Reachability over Tor',
+              onPressed: _isPinging ? null : _pingPeer,
+            ),
+            PopupMenuButton<String>(
+              onSelected: (val) {
+                if (val == 'edit_name') {
+                  _showEditNicknameDialog(contact);
+                } else if (val == 'delete') {
+                  _confirmDelete(contact);
+                }
+              },
+              itemBuilder: (context) => [
+                const PopupMenuItem(
+                  value: 'edit_name',
+                  child: Row(
+                    children: [
+                      Icon(Icons.edit_outlined, size: 18, color: AppTheme.torPurpleLight),
+                      SizedBox(width: 8),
+                      Text('Edit contact name'),
+                    ],
+                  ),
+                ),
+                const PopupMenuItem(
+                  value: 'delete',
+                  child: Row(
+                    children: [
+                      Icon(Icons.delete_outline, size: 18, color: AppTheme.errorRed),
+                      SizedBox(width: 8),
+                      Text('Delete Conversation', style: TextStyle(color: AppTheme.errorRed)),
+                    ],
+                  ),
+                ),
+              ],
+            ),
           ],
         ),
-        actions: [
-          IconButton(
-            icon: _isPinging
-                ? const SizedBox(
-                    width: 16,
-                    height: 16,
-                    child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
-                  )
-                : Icon(
-                    Icons.wifi_tethering,
-                    color: pingResult?.isOnline == true ? AppTheme.onlineGreen : AppTheme.textSecondary,
-                  ),
-            tooltip: 'Ping Peer Reachability over Tor',
-            onPressed: _isPinging ? null : _pingPeer,
-          ),
-          PopupMenuButton<String>(
-            onSelected: (val) {
-              if (val == 'delete') {
-                _confirmDelete();
-              }
-            },
-            itemBuilder: (context) => [
-              const PopupMenuItem(
-                value: 'delete',
-                child: Row(
-                  children: [
-                    Icon(Icons.delete_outline, size: 18, color: AppTheme.errorRed),
-                    SizedBox(width: 8),
-                    Text('Delete Conversation', style: TextStyle(color: AppTheme.errorRed)),
-                  ],
-                ),
-              ),
-            ],
-          ),
-        ],
-      ),
       body: Column(
         children: [
           // Security disclaimer header
@@ -542,10 +666,10 @@ class _ChatDetailScreenState extends State<ChatDetailScreen> {
                     child: TextField(
                       controller: _textController,
                       focusNode: _focusNode,
-                      maxLines: 4,
+                      maxLines: 5,
                       minLines: 1,
-                      textInputAction: TextInputAction.send,
-                      onSubmitted: (_) => _sendMessage(),
+                      keyboardType: TextInputType.multiline,
+                      textInputAction: TextInputAction.newline,
                       decoration: const InputDecoration(
                         hintText: 'Type an encrypted message...',
                         contentPadding: EdgeInsets.symmetric(horizontal: 16, vertical: 12),

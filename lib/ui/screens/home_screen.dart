@@ -75,6 +75,152 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  void _showEditNicknameDialog(Contact contact) {
+    final nameController = TextEditingController(text: contact.nickname);
+    showDialog(
+      context: context,
+      builder: (dialogCtx) => AlertDialog(
+        backgroundColor: AppTheme.cardColor,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: const Row(
+          children: [
+            Icon(Icons.edit_note, color: AppTheme.torPurpleLight, size: 24),
+            SizedBox(width: 8),
+            Text('Edit Contact Name', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Set a local nickname for this contact. This name is private to your device only and is never broadcast or shared with others.',
+              style: TextStyle(fontSize: 13, color: AppTheme.textSecondary),
+            ),
+            const SizedBox(height: 16),
+            TextField(
+              controller: nameController,
+              autofocus: true,
+              decoration: const InputDecoration(
+                labelText: 'Contact Name',
+                hintText: 'e.g. Alice, Bob, Work',
+                prefixIcon: Icon(Icons.person, color: AppTheme.textSecondary, size: 20),
+              ),
+              textInputAction: TextInputAction.done,
+              onSubmitted: (_) {
+                final newName = nameController.text.trim();
+                if (newName.isNotEmpty) {
+                  Navigator.pop(dialogCtx);
+                  context.read<ChatProvider>().updateContactNickname(contact.onionAddress, newName);
+                }
+              },
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogCtx),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: AppTheme.torPurple),
+            onPressed: () {
+              final newName = nameController.text.trim();
+              if (newName.isNotEmpty) {
+                Navigator.pop(dialogCtx);
+                context.read<ChatProvider>().updateContactNickname(contact.onionAddress, newName);
+              }
+            },
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showContactOptions(Contact contact) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: AppTheme.surface,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (sheetCtx) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
+                child: Row(
+                  children: [
+                    CircleAvatar(
+                      radius: 20,
+                      backgroundColor: AppTheme.torPurple,
+                      child: Text(
+                        contact.nickname.isNotEmpty ? contact.nickname[0].toUpperCase() : 'P',
+                        style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.white, fontSize: 18),
+                      ),
+                    ),
+                    const SizedBox(width: 14),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            contact.nickname,
+                            style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                          Text(
+                            contact.onionAddress.length > 20
+                                ? '${contact.onionAddress.substring(0, 16)}...onion'
+                                : contact.onionAddress,
+                            style: const TextStyle(fontFamily: 'monospace', fontSize: 11, color: AppTheme.textSecondary),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const Divider(),
+              ListTile(
+                leading: const Icon(Icons.edit_outlined, color: AppTheme.torPurpleLight),
+                title: const Text('Edit contact name'),
+                subtitle: const Text('Private to your device (never broadcasted)', style: TextStyle(fontSize: 12, color: AppTheme.textSecondary)),
+                onTap: () {
+                  Navigator.pop(sheetCtx);
+                  _showEditNicknameDialog(contact);
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.copy_rounded, color: AppTheme.textSecondary),
+                title: const Text('Copy onion address'),
+                onTap: () {
+                  Navigator.pop(sheetCtx);
+                  Clipboard.setData(ClipboardData(text: contact.onionAddress));
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Onion address copied!')),
+                  );
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.delete_outline, color: AppTheme.errorRed),
+                title: const Text('Delete conversation', style: TextStyle(color: AppTheme.errorRed)),
+                onTap: () {
+                  Navigator.pop(sheetCtx);
+                  _confirmDeleteContact(contact);
+                },
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   void _confirmDeleteContact(Contact contact) async {
     final confirmed = await showDialog<bool>(
       context: context,
@@ -307,97 +453,100 @@ class _HomeScreenState extends State<HomeScreen> {
                               ? DateFormat('HH:mm').format(c.lastMessageTimestamp!)
                               : '';
 
-                          return ListTile(
-                            selected: isSelected,
-                            selectedTileColor: AppTheme.torPurple.withValues(alpha: 0.15),
-                            contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-                            leading: Stack(
-                              children: [
-                                CircleAvatar(
-                                  radius: 24,
-                                  backgroundColor: AppTheme.torPurple,
-                                  child: Text(
-                                    c.nickname.isNotEmpty ? c.nickname[0].toUpperCase() : 'P',
-                                    style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 18, color: Colors.white),
+                          return GestureDetector(
+                            onSecondaryTap: () => _showContactOptions(c),
+                            child: ListTile(
+                              selected: isSelected,
+                              selectedTileColor: AppTheme.torPurple.withValues(alpha: 0.15),
+                              contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                              leading: Stack(
+                                children: [
+                                  CircleAvatar(
+                                    radius: 24,
+                                    backgroundColor: AppTheme.torPurple,
+                                    child: Text(
+                                      c.nickname.isNotEmpty ? c.nickname[0].toUpperCase() : 'P',
+                                      style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 18, color: Colors.white),
+                                    ),
                                   ),
-                                ),
-                                if (c.isOnline)
-                                  Positioned(
-                                    right: 0,
-                                    bottom: 0,
-                                    child: Container(
-                                      width: 12,
-                                      height: 12,
-                                      decoration: BoxDecoration(
-                                        color: AppTheme.onlineGreen,
-                                        shape: BoxShape.circle,
-                                        border: Border.all(color: AppTheme.background, width: 2),
+                                  if (c.isOnline)
+                                    Positioned(
+                                      right: 0,
+                                      bottom: 0,
+                                      child: Container(
+                                        width: 12,
+                                        height: 12,
+                                        decoration: BoxDecoration(
+                                          color: AppTheme.onlineGreen,
+                                          shape: BoxShape.circle,
+                                          border: Border.all(color: AppTheme.background, width: 2),
+                                        ),
+                                      ),
+                                    ),
+                                ],
+                              ),
+                              title: Row(
+                                children: [
+                                  Expanded(
+                                    child: Text(
+                                      c.nickname,
+                                      style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 15),
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                  ),
+                                  if (timeStr.isNotEmpty)
+                                    Text(
+                                      timeStr,
+                                      style: const TextStyle(fontSize: 11, color: AppTheme.textSecondary),
+                                    ),
+                                ],
+                              ),
+                              subtitle: Row(
+                                children: [
+                                  Expanded(
+                                    child: Text(
+                                      c.lastMessage ?? (c.onionAddress.length > 20
+                                          ? '${c.onionAddress.substring(0, 16)}...onion'
+                                          : c.onionAddress),
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: TextStyle(
+                                        fontSize: 13,
+                                        color: c.unreadCount > 0 ? AppTheme.textPrimary : AppTheme.textSecondary,
+                                        fontWeight: c.unreadCount > 0 ? FontWeight.w600 : FontWeight.normal,
                                       ),
                                     ),
                                   ),
-                              ],
-                            ),
-                            title: Row(
-                              children: [
-                                Expanded(
-                                  child: Text(
-                                    c.nickname,
-                                    style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 15),
-                                    overflow: TextOverflow.ellipsis,
-                                  ),
-                                ),
-                                if (timeStr.isNotEmpty)
-                                  Text(
-                                    timeStr,
-                                    style: const TextStyle(fontSize: 11, color: AppTheme.textSecondary),
-                                  ),
-                              ],
-                            ),
-                            subtitle: Row(
-                              children: [
-                                Expanded(
-                                  child: Text(
-                                    c.lastMessage ?? (c.onionAddress.length > 20
-                                        ? '${c.onionAddress.substring(0, 16)}...onion'
-                                        : c.onionAddress),
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: TextStyle(
-                                      fontSize: 13,
-                                      color: c.unreadCount > 0 ? AppTheme.textPrimary : AppTheme.textSecondary,
-                                      fontWeight: c.unreadCount > 0 ? FontWeight.w600 : FontWeight.normal,
+                                  if (c.unreadCount > 0)
+                                    Container(
+                                      margin: const EdgeInsets.only(left: 6),
+                                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                                      decoration: BoxDecoration(
+                                        color: AppTheme.torPurple,
+                                        borderRadius: BorderRadius.circular(10),
+                                      ),
+                                      child: Text(
+                                        c.unreadCount.toString(),
+                                        style: const TextStyle(fontSize: 11, color: Colors.white, fontWeight: FontWeight.bold),
+                                      ),
                                     ),
-                                  ),
-                                ),
-                                if (c.unreadCount > 0)
-                                  Container(
-                                    margin: const EdgeInsets.only(left: 6),
-                                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                                    decoration: BoxDecoration(
-                                      color: AppTheme.torPurple,
-                                      borderRadius: BorderRadius.circular(10),
+                                ],
+                              ),
+                              onLongPress: () => _showContactOptions(c),
+                              onTap: () {
+                                chatProvider.selectChat(c);
+                                if (!isWide) {
+                                  Navigator.push(
+                                    context,
+                                    MaterialPageRoute(
+                                      builder: (_) => ChatDetailScreen(contact: c),
                                     ),
-                                    child: Text(
-                                      c.unreadCount.toString(),
-                                      style: const TextStyle(fontSize: 11, color: Colors.white, fontWeight: FontWeight.bold),
-                                    ),
-                                  ),
-                              ],
+                                  ).then((_) {
+                                    chatProvider.selectChat(null);
+                                  });
+                                }
+                              },
                             ),
-                            onLongPress: () => _confirmDeleteContact(c),
-                            onTap: () {
-                              chatProvider.selectChat(c);
-                              if (!isWide) {
-                                Navigator.push(
-                                  context,
-                                  MaterialPageRoute(
-                                    builder: (_) => ChatDetailScreen(contact: c),
-                                  ),
-                                ).then((_) {
-                                  chatProvider.selectChat(null);
-                                });
-                              }
-                            },
                           );
                         },
                       ),

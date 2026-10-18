@@ -1,0 +1,4 @@
+bug fixes required :
+    1. the chats aren't on the latest chats when opened in Android which needs fixing, everytime i open the app after clearing recents it shall greet me on the default inbox menu and when i open the chat and if new message has appeared it shall show me from there fist and if no new messages then it can show me the state i left after reading the message.
+    2. the App remembers the state of opened chat when recent apps closed and reopened from launcher which shall be avoided as discussed in the point above.
+    3. long press only works if long pressed on the timestamp of a particular text and long pressing on the text of chat bubble shall not trigger any other options apart from the inbuilt menus of the TorChat itself.

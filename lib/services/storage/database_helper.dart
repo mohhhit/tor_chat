@@ -194,6 +194,16 @@ class DatabaseHelper {
     );
   }
 
+  Future<void> updateContactNickname(String onionAddress, String newNickname) async {
+    final db = await database;
+    await db.update(
+      'contacts',
+      {'nickname': newNickname.trim()},
+      where: 'onion_address = ?',
+      whereArgs: [onionAddress],
+    );
+  }
+
   Future<void> updateContactLastMessage({
     required String onionAddress,
     required String lastMessage,
