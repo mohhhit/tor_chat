@@ -52,6 +52,24 @@
             </intent-filter>
         </receiver>
 
+        <receiver
+            android:name=".NotificationReplyReceiver"
+            android:enabled="true"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.onionchat.tor_chat.ACTION_REPLY"/>
+            </intent-filter>
+        </receiver>
+
+        <receiver
+            android:name=".NotificationDismissReceiver"
+            android:enabled="true"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.onionchat.tor_chat.ACTION_DISMISS_NOTIFICATION"/>
+            </intent-filter>
+        </receiver>
+
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />

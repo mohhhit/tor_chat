@@ -26,6 +26,7 @@ class MainActivity : FlutterActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        currentActivity = this
         createMessageNotificationChannel(applicationContext)
 
         // Start Tor background service immediately to protect the process
@@ -44,20 +45,36 @@ class MainActivity : FlutterActivity() {
                 requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 101)
             }
         }
+
+        // When activity is created: if chat_onion was given (from notification), open chat;
+        // otherwise (e.g. fresh launch or reopened from launcher/recents), reset to inbox
+        val chatOnion = intent?.getStringExtra("chat_onion")
+        val currentEngine = TorEngineHolder.getOrCreateEngine(this)
+        if (chatOnion != null) {
+            intent?.removeExtra("chat_onion")
+            MethodChannel(currentEngine.dartExecutor.binaryMessenger, CHANNEL).invokeMethod("onSelectChat", chatOnion)
+        } else {
+            MethodChannel(currentEngine.dartExecutor.binaryMessenger, CHANNEL).invokeMethod("onResetToInbox", null)
+        }
     }
 
-    override fun onBackPressed() {
-        moveTaskToBack(true)
+    override fun onDestroy() {
+        if (currentActivity == this) {
+            currentActivity = null
+        }
+        super.onDestroy()
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
         val chatOnion = intent.getStringExtra("chat_onion")
+        val currentEngine = TorEngineHolder.getOrCreateEngine(this)
         if (chatOnion != null) {
             intent.removeExtra("chat_onion")
-            val currentEngine = TorEngineHolder.getOrCreateEngine(this)
             MethodChannel(currentEngine.dartExecutor.binaryMessenger, CHANNEL).invokeMethod("onSelectChat", chatOnion)
+        } else if (intent.action == Intent.ACTION_MAIN && intent.hasCategory(Intent.CATEGORY_LAUNCHER)) {
+            MethodChannel(currentEngine.dartExecutor.binaryMessenger, CHANNEL).invokeMethod("onResetToInbox", null)
         }
     }
 
@@ -66,30 +83,23 @@ class MainActivity : FlutterActivity() {
         // Ensure channel handler is ready
         setupNativeChannel(flutterEngine, applicationContext)
 
-        // Forward any initial chat onion from launcher intent
-        intent?.getStringExtra("chat_onion")?.let { initialChat ->
+        // Forward initial chat onion if present, otherwise reset to inbox
+        val initialChat = intent?.getStringExtra("chat_onion")
+        if (initialChat != null) {
             intent?.removeExtra("chat_onion")
             MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).invokeMethod("onSelectChat", initialChat)
+        } else {
+            MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).invokeMethod("onResetToInbox", null)
         }
     }
 
     companion object {
         const val CHANNEL = "com.onionchat.tor_chat/native"
-        const val MSG_CHANNEL_ID = "tor_chat_incoming_messages"
+        const val MSG_CHANNEL_ID = NotificationHelper.MSG_CHANNEL_ID
+        private var currentActivity: MainActivity? = null
 
         fun createMessageNotificationChannel(context: Context) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                val channel = NotificationChannel(
-                    MSG_CHANNEL_ID,
-                    "TorChat Messages",
-                    NotificationManager.IMPORTANCE_HIGH
-                ).apply {
-                    description = "Notifies you when peer messages arrive"
-                    enableVibration(true)
-                }
-                val manager = context.getSystemService(NotificationManager::class.java)
-                manager?.createNotificationChannel(channel)
-            }
+            NotificationHelper.createNotificationChannel(context)
         }
 
         fun setupNativeChannel(flutterEngine: FlutterEngine, context: Context) {
@@ -99,11 +109,14 @@ class MainActivity : FlutterActivity() {
                 when (call.method) {
                     "moveToBackground" -> {
                         try {
-                            val homeIntent = Intent(Intent.ACTION_MAIN).apply {
-                                addCategory(Intent.CATEGORY_HOME)
-                                flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                            val moved = currentActivity?.moveTaskToBack(true) ?: false
+                            if (!moved) {
+                                val homeIntent = Intent(Intent.ACTION_MAIN).apply {
+                                    addCategory(Intent.CATEGORY_HOME)
+                                    flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                                }
+                                appContext.startActivity(homeIntent)
                             }
-                            appContext.startActivity(homeIntent)
                             result.success(true)
                         } catch (e: Exception) {
                             result.error("MOVE_ERROR", e.message, null)
@@ -187,48 +200,23 @@ class MainActivity : FlutterActivity() {
                             val sender = call.argument<String>("sender") ?: "Peer"
                             val content = call.argument<String>("content") ?: "New message"
                             val chatOnion = call.argument<String>("chatOnion")
-
-                            val launchIntent = appContext.packageManager.getLaunchIntentForPackage(appContext.packageName)?.apply {
-                                action = Intent.ACTION_MAIN
-                                addCategory(Intent.CATEGORY_LAUNCHER)
-                                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
-                                if (chatOnion != null) {
-                                    putExtra("chat_onion", chatOnion)
-                                }
+                            if (!chatOnion.isNullOrEmpty()) {
+                                NotificationHelper.showNotification(appContext, chatOnion, sender, content)
                             }
-
-                            val pendingIntent = if (launchIntent != null) {
-                                val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                                    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-                                } else {
-                                    PendingIntent.FLAG_UPDATE_CURRENT
-                                }
-                                PendingIntent.getActivity(appContext, (System.currentTimeMillis() % 10000).toInt(), launchIntent, flags)
-                            } else null
-
-                            val iconRes = appContext.applicationInfo.icon.takeIf { it != 0 } ?: android.R.drawable.stat_notify_chat
-
-                            val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                                android.app.Notification.Builder(appContext, MSG_CHANNEL_ID)
-                            } else {
-                                @Suppress("DEPRECATION")
-                                android.app.Notification.Builder(appContext)
-                            }
-
-                            builder.setContentTitle(sender)
-                                .setContentText(content)
-                                .setSmallIcon(iconRes)
-                                .setAutoCancel(true)
-
-                            if (pendingIntent != null) {
-                                builder.setContentIntent(pendingIntent)
-                            }
-
-                            val notificationManager = appContext.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
-                            notificationManager?.notify((System.currentTimeMillis() % 10000).toInt(), builder.build())
                             result.success(true)
                         } catch (e: Exception) {
                             result.error("NOTIFICATION_ERROR", e.message, null)
+                        }
+                    }
+                    "dismissNotification" -> {
+                        try {
+                            val chatOnion = call.argument<String>("chatOnion")
+                            if (!chatOnion.isNullOrEmpty()) {
+                                NotificationHelper.dismissNotification(appContext, chatOnion)
+                            }
+                            result.success(true)
+                        } catch (e: Exception) {
+                            result.error("DISMISS_ERROR", e.message, null)
                         }
                     }
                     else -> result.notImplemented()

@@ -206,12 +206,12 @@ class _PooledSocket {
 
   bool get isClosed => reader.isClosed;
 
-  /// Closes and discards sockets that are older than 45 seconds or idle for more than 20 seconds.
-  /// Tor Onion circuits across mobile devices, WiFi changes, or sleep states must not be reused when stale.
+  /// Closes and discards sockets that are older than 5 minutes or idle for more than 110 seconds.
+  /// Tor keep-alive connections stay active across user typing delays without establishing duplicate circuits.
   bool get isExpired {
     final now = DateTime.now();
-    return now.difference(createdAt) > const Duration(seconds: 45) ||
-           now.difference(lastUsed) > const Duration(seconds: 20);
+    return now.difference(createdAt) > const Duration(minutes: 5) ||
+           now.difference(lastUsed) > const Duration(seconds: 110);
   }
 
   Future<void> close() async {
@@ -226,11 +226,43 @@ class Socks5Client {
   final String proxyHost;
   final int proxyPort;
   final Map<String, _PooledSocket> _pool = {};
+  final Map<String, Future<void>> _peerQueues = {};
 
   Socks5Client({
     this.proxyHost = '127.0.0.1',
     this.proxyPort = 9050,
   });
+
+  /// Serializes operations to the same peer to guarantee in-order HTTP requests
+  /// and reuse the persistent keep-alive socket safely without stream interleaving.
+  Future<T> _synchronized<T>(String key, Future<T> Function() action) {
+    final completer = Completer<T>();
+    final prev = _peerQueues[key] ?? Future.value();
+
+    final current = prev.then((_) async {
+      try {
+        final res = await action();
+        completer.complete(res);
+      } catch (e, st) {
+        completer.completeError(e, st);
+      }
+    }, onError: (_) async {
+      try {
+        final res = await action();
+        completer.complete(res);
+      } catch (e, st) {
+        completer.completeError(e, st);
+      }
+    });
+
+    _peerQueues[key] = current.whenComplete(() {
+      if (identical(_peerQueues[key], current)) {
+        _peerQueues.remove(key);
+      }
+    });
+
+    return completer.future;
+  }
 
   /// Closes and removes any active connection to [onionAddress] from the pool
   Future<void> invalidatePeer(String onionAddress, {int port = 80}) async {
@@ -322,97 +354,115 @@ class Socks5Client {
     Map<String, String>? headers,
     String? body,
     Duration timeout = const Duration(seconds: 40),
-  }) async {
+  }) {
     final cleanHost = onionAddress.trim();
     final poolKey = '$cleanHost:$port';
 
-    // Try up to 2 attempts: 1st with pooled connection, 2nd with fresh connection if old timed out
-    for (int attempt = 0; attempt < 2; attempt++) {
-      _PooledSocket? pooled = _pool[poolKey];
+    return _synchronized(poolKey, () async {
+      // Try up to 2 attempts: 1st with pooled connection, 2nd with fresh connection if old timed out
+      for (int attempt = 0; attempt < 2; attempt++) {
+        _PooledSocket? pooled = _pool[poolKey];
 
-      if (pooled != null && (pooled.isClosed || pooled.isExpired || pooled.isBusy)) {
-        if (pooled.isClosed || pooled.isExpired) {
+        if (pooled != null && (pooled.isClosed || pooled.isExpired)) {
           await pooled.close();
-          _pool.remove(poolKey);
+          if (identical(_pool[poolKey], pooled)) {
+            _pool.remove(poolKey);
+          }
           pooled = null;
         }
-      }
 
-      bool isFresh = false;
-      if (pooled == null || pooled.isBusy) {
-        pooled = await _createConnection(cleanHost, port, timeout);
-        isFresh = true;
-        _pool[poolKey] = pooled;
-      }
-
-      pooled.isBusy = true;
-      pooled.lastUsed = DateTime.now();
-
-      try {
-        final bodyBytes = body != null ? utf8.encode(body) : <int>[];
-        final reqHeaders = <String, String>{
-          'Host': cleanHost,
-          'User-Agent': 'TorChatP2P/1.0',
-          'Connection': 'keep-alive',
-          'Content-Length': bodyBytes.length.toString(),
-          if (body != null) 'Content-Type': 'application/json; charset=utf-8',
-          ...?headers,
-        };
-
-        final buffer = StringBuffer();
-        buffer.write('$method $path HTTP/1.1\r\n');
-        for (final entry in reqHeaders.entries) {
-          buffer.write('${entry.key}: ${entry.value}\r\n');
+        bool isFresh = false;
+        if (pooled == null) {
+          pooled = await _createConnection(cleanHost, port, timeout);
+          isFresh = true;
+          _pool[poolKey] = pooled;
         }
-        buffer.write('\r\n');
 
-        pooled.socket.add(utf8.encode(buffer.toString()));
-        if (bodyBytes.isNotEmpty) {
-          pooled.socket.add(bodyBytes);
-        }
-        await pooled.socket.flush();
+        pooled.isBusy = true;
+        pooled.lastUsed = DateTime.now();
 
-        final response = await pooled.reader.readHttpResponse(timeout);
+        try {
+          final bodyBytes = body != null ? utf8.encode(body) : <int>[];
+          final reqHeaders = <String, String>{
+            'Host': cleanHost,
+            'User-Agent': 'TorChatP2P/1.0',
+            'Connection': 'keep-alive',
+            'Content-Length': bodyBytes.length.toString(),
+            if (body != null) 'Content-Type': 'application/json; charset=utf-8',
+            ...?headers,
+          };
 
-        if (response.headers['connection']?.toLowerCase() == 'close') {
+          final buffer = StringBuffer();
+          buffer.write('$method $path HTTP/1.1\r\n');
+          for (final entry in reqHeaders.entries) {
+            buffer.write('${entry.key}: ${entry.value}\r\n');
+          }
+          buffer.write('\r\n');
+
+          pooled.socket.add(utf8.encode(buffer.toString()));
+          if (bodyBytes.isNotEmpty) {
+            pooled.socket.add(bodyBytes);
+          }
+          await pooled.socket.flush();
+
+          final response = await pooled.reader.readHttpResponse(timeout);
+
+          if (response.headers['connection']?.toLowerCase() == 'close') {
+            await pooled.close();
+            if (identical(_pool[poolKey], pooled)) {
+              _pool.remove(poolKey);
+            }
+          } else {
+            pooled.isBusy = false;
+            pooled.lastUsed = DateTime.now();
+          }
+
+          return response;
+        } catch (e) {
           await pooled.close();
-          _pool.remove(poolKey);
-        } else {
-          pooled.isBusy = false;
+          if (identical(_pool[poolKey], pooled)) {
+            _pool.remove(poolKey);
+          }
+          // If recycled connection closed while idle in pool, transparently retry once with fresh connection
+          if (!isFresh && attempt == 0) {
+            continue;
+          }
+          rethrow;
         }
-
-        return response;
-      } catch (e) {
-        await pooled.close();
-        _pool.remove(poolKey);
-        // If recycled connection closed while idle in pool, transparently retry once with fresh connection
-        if (!isFresh && attempt == 0) {
-          continue;
-        }
-        rethrow;
       }
-    }
 
-    throw Exception('Failed to send request through Tor to $cleanHost');
+      throw Exception('Failed to send request through Tor to $cleanHost');
+    });
   }
 
   /// Pre-warms an onion circuit in the background so the user's first message delivers instantly
   Future<void> prewarm(String onionAddress, {int port = 80}) async {
     final cleanHost = onionAddress.trim();
     final poolKey = '$cleanHost:$port';
-    if (_pool.containsKey(poolKey) && !_pool[poolKey]!.isClosed && !_pool[poolKey]!.isExpired) {
+
+    final existing = _pool[poolKey];
+    if (existing != null && !existing.isClosed && !existing.isExpired) {
       return;
     }
-    if (_pool.containsKey(poolKey)) {
-      final old = _pool.remove(poolKey);
-      await old?.close();
-    }
-    try {
-      final pooled = await _createConnection(cleanHost, port, const Duration(seconds: 35));
-      _pool[poolKey] = pooled;
-    } catch (_) {
-      // Prewarm is best-effort background
-    }
+
+    return _synchronized(poolKey, () async {
+      final pooled = _pool[poolKey];
+      if (pooled != null && !pooled.isClosed && !pooled.isExpired) {
+        return;
+      }
+      if (pooled != null) {
+        await pooled.close();
+        if (identical(_pool[poolKey], pooled)) {
+          _pool.remove(poolKey);
+        }
+      }
+      try {
+        final newConn = await _createConnection(cleanHost, port, const Duration(seconds: 35));
+        _pool[poolKey] = newConn;
+      } catch (_) {
+        // Prewarm is best-effort background
+      }
+    });
   }
 
   /// Closes all pooled connections on shutdown

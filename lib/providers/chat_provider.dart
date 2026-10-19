@@ -6,6 +6,12 @@ import '../services/p2p/chat_coordinator.dart';
 import '../services/p2p/peer_client.dart';
 import '../services/storage/database_helper.dart';
 
+class ChatScrollState {
+  final double offset;
+  final DateTime? lastMessageTimestamp;
+  const ChatScrollState({required this.offset, this.lastMessageTimestamp});
+}
+
 class ChatProvider extends ChangeNotifier {
   final ChatCoordinator _coordinator = ChatCoordinator.instance;
   final DatabaseHelper _db = DatabaseHelper.instance;
@@ -15,8 +21,10 @@ class ChatProvider extends ChangeNotifier {
   List<ChatMessage> _activeMessages = [];
   bool _isLoading = false;
   final Map<String, PeerPingResult> _pingCache = {};
+  final Map<String, ChatScrollState> _scrollStates = {};
 
   StreamSubscription<ChatMessage>? _incomingMsgSub;
+  StreamSubscription<ChatMessage>? _sentMsgSub;
   StreamSubscription<Map<String, dynamic>>? _receiptSub;
   StreamSubscription<String>? _chatSelectionSub;
   StreamSubscription<Map<String, String>>? _messageDeletedSub;
@@ -47,6 +55,19 @@ class ChatProvider extends ChangeNotifier {
           _activeMessages.add(msg);
         }
         await _db.clearUnread(msg.chatOnion);
+      }
+      await loadContacts();
+      notifyListeners();
+    });
+
+    _sentMsgSub = _coordinator.sentMessages.listen((msg) async {
+      final isCurrentChat = _selectedContact != null &&
+          _isSameOnion(_selectedContact!.onionAddress, msg.chatOnion);
+
+      if (isCurrentChat) {
+        if (!_activeMessages.any((m) => m.id == msg.id)) {
+          _activeMessages.add(msg);
+        }
       }
       await loadContacts();
       notifyListeners();
@@ -111,6 +132,7 @@ class ChatProvider extends ChangeNotifier {
     _coordinator.activeChatOnion = contact?.onionAddress;
 
     if (contact != null) {
+      _coordinator.dismissNotification(contact.onionAddress);
       _coordinator.prewarmPeerConnection(contact.onionAddress);
 
       // Fetch unread incoming message IDs to send read receipt to peer
@@ -138,6 +160,7 @@ class ChatProvider extends ChangeNotifier {
   /// Refreshes current active chat conversation and clears unread when app/window regains focus
   Future<void> refreshActiveChat() async {
     if (_selectedContact != null) {
+      _coordinator.dismissNotification(_selectedContact!.onionAddress);
       await selectChat(_selectedContact);
     } else {
       await loadContacts();
@@ -152,29 +175,35 @@ class ChatProvider extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> sendMessage(String content) async {
-    if (_selectedContact == null || content.trim().isEmpty) return;
+  Future<void> sendMessage(String content, {String? recipientOnion}) async {
+    final recipient = recipientOnion ?? _selectedContact?.onionAddress;
+    if (recipient == null || content.trim().isEmpty) return;
 
     final sent = await _coordinator.sendMessage(
-      recipientOnion: _selectedContact!.onionAddress,
+      recipientOnion: recipient,
       content: content.trim(),
     );
 
-    _activeMessages.add(sent);
+    if (!_activeMessages.any((m) => m.id == sent.id)) {
+      _activeMessages.add(sent);
+    }
     await loadContacts();
     notifyListeners();
   }
 
-  Future<void> sendImage(String imagePath, {String caption = ''}) async {
-    if (_selectedContact == null) return;
+  Future<void> sendImage(String imagePath, {String caption = '', String? recipientOnion}) async {
+    final recipient = recipientOnion ?? _selectedContact?.onionAddress;
+    if (recipient == null) return;
 
     final sent = await _coordinator.sendImageMessage(
-      recipientOnion: _selectedContact!.onionAddress,
+      recipientOnion: recipient,
       originalImagePath: imagePath,
       caption: caption,
     );
 
-    _activeMessages.add(sent);
+    if (!_activeMessages.any((m) => m.id == sent.id)) {
+      _activeMessages.add(sent);
+    }
     await loadContacts();
     notifyListeners();
   }
@@ -214,12 +243,24 @@ class ChatProvider extends ChangeNotifier {
 
   Future<void> deleteContact(String onionAddress) async {
     await _db.deleteContact(onionAddress);
+    _scrollStates.remove(onionAddress.toLowerCase());
     if (_selectedContact?.onionAddress == onionAddress) {
       _selectedContact = null;
       _coordinator.activeChatOnion = null;
       _activeMessages = [];
     }
     await loadContacts();
+  }
+
+  ChatScrollState? getScrollState(String onionAddress) {
+    return _scrollStates[onionAddress.toLowerCase()];
+  }
+
+  void saveScrollState(String onionAddress, double offset, DateTime? lastTimestamp) {
+    _scrollStates[onionAddress.toLowerCase()] = ChatScrollState(
+      offset: offset,
+      lastMessageTimestamp: lastTimestamp,
+    );
   }
 
   Future<PeerPingResult> pingContact(String onionAddress) async {
@@ -253,6 +294,7 @@ class ChatProvider extends ChangeNotifier {
   @override
   void dispose() {
     _incomingMsgSub?.cancel();
+    _sentMsgSub?.cancel();
     _receiptSub?.cancel();
     _chatSelectionSub?.cancel();
     _messageDeletedSub?.cancel();

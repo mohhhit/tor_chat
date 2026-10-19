@@ -198,32 +198,13 @@ class _ChatBubbleState extends State<ChatBubble> {
                     if (message.content.isNotEmpty)
                       Padding(
                         padding: const EdgeInsets.symmetric(horizontal: 4),
-                        child: SelectableText(
+                        child: Text(
                           message.content,
                           style: const TextStyle(
                             fontSize: 14,
                             color: AppTheme.textPrimary,
                             height: 1.35,
                           ),
-                          contextMenuBuilder: (ctx, editableTextState) {
-                            final List<ContextMenuButtonItem> buttonItems =
-                                editableTextState.contextMenuButtonItems;
-                            if (widget.onDelete != null) {
-                              buttonItems.add(
-                                ContextMenuButtonItem(
-                                  label: 'Delete',
-                                  onPressed: () {
-                                    ContextMenuController.removeAny();
-                                    widget.onDelete!();
-                                  },
-                                ),
-                              );
-                            }
-                            return AdaptiveTextSelectionToolbar.buttonItems(
-                              anchors: editableTextState.contextMenuAnchors,
-                              buttonItems: buttonItems,
-                            );
-                          },
                         ),
                       ),
 

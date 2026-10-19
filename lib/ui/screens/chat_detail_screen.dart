@@ -20,15 +20,31 @@ class ChatDetailScreen extends StatefulWidget {
 
 class _ChatDetailScreenState extends State<ChatDetailScreen> {
   final TextEditingController _textController = TextEditingController();
-  final ScrollController _scrollController = ScrollController();
+  late final ScrollController _scrollController;
   final FocusNode _focusNode = FocusNode();
+  late ChatProvider _chatProvider;
   bool _isPinging = false;
-
+  double _currentScrollOffset = 0.0;
   int _lastMessageCount = 0;
 
   @override
   void initState() {
     super.initState();
+    final cp = context.read<ChatProvider>();
+    final saved = cp.getScrollState(widget.contact.onionAddress);
+
+    // If new messages appeared since user last read this chat, start at 0.0 (newest messages).
+    // If no new messages appeared, preserve the scroll offset where the user left off.
+    final hadNewMessages = widget.contact.unreadCount > 0 ||
+        (saved != null &&
+            saved.lastMessageTimestamp != null &&
+            widget.contact.lastMessageTimestamp != null &&
+            widget.contact.lastMessageTimestamp!.isAfter(saved.lastMessageTimestamp!));
+
+    final initialOffset = (hadNewMessages || saved == null) ? 0.0 : saved.offset;
+    _currentScrollOffset = initialOffset;
+    _scrollController = ScrollController(initialScrollOffset: initialOffset);
+
     _focusNode.onKeyEvent = (node, event) {
       if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
         if (event is KeyDownEvent) {
@@ -64,7 +80,21 @@ class _ChatDetailScreenState extends State<ChatDetailScreen> {
   }
 
   @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _chatProvider = context.read<ChatProvider>();
+  }
+
+  @override
   void dispose() {
+    final lastTimestamp = _chatProvider.activeMessages.isNotEmpty
+        ? _chatProvider.activeMessages.last.timestamp
+        : widget.contact.lastMessageTimestamp;
+    _chatProvider.saveScrollState(
+      widget.contact.onionAddress,
+      _currentScrollOffset,
+      lastTimestamp,
+    );
     _textController.dispose();
     _scrollController.dispose();
     _focusNode.dispose();
@@ -74,7 +104,7 @@ class _ChatDetailScreenState extends State<ChatDetailScreen> {
   void _scrollToBottom() {
     if (_scrollController.hasClients) {
       _scrollController.animateTo(
-        _scrollController.position.maxScrollExtent,
+        0.0,
         duration: const Duration(milliseconds: 200),
         curve: Curves.easeOut,
       );
@@ -86,7 +116,7 @@ class _ChatDetailScreenState extends State<ChatDetailScreen> {
     if (text.isEmpty) return;
     _textController.clear();
 
-    await context.read<ChatProvider>().sendMessage(text);
+    await context.read<ChatProvider>().sendMessage(text, recipientOnion: widget.contact.onionAddress);
     _scrollToBottom();
     _focusNode.requestFocus();
   }
@@ -254,7 +284,7 @@ class _ChatDetailScreenState extends State<ChatDetailScreen> {
             onPressed: () async {
               final caption = captionController.text.trim();
               Navigator.pop(dialogCtx);
-              await context.read<ChatProvider>().sendImage(imageFile.path, caption: caption);
+              await context.read<ChatProvider>().sendImage(imageFile.path, caption: caption, recipientOnion: widget.contact.onionAddress);
               _scrollToBottom();
             },
           ),
@@ -387,19 +417,20 @@ class _ChatDetailScreenState extends State<ChatDetailScreen> {
 
   void _showDeleteMessageDialog(ChatMessage message) {
     final canDeleteForEveryone = message.isOutgoing && !message.isDeleted;
+    final canCopy = message.content.isNotEmpty && !message.isDeleted;
 
     showDialog(
       context: context,
       builder: (dialogCtx) => AlertDialog(
         backgroundColor: AppTheme.cardColor,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        title: const Text(
-          'Delete message?',
-          style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+        title: Text(
+          message.isDeleted ? 'Message' : 'Message Options',
+          style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
         ),
         content: canDeleteForEveryone
             ? const Text(
-                'You can delete this message for everyone or just for yourself.',
+                'Choose an action for this message.',
                 style: TextStyle(fontSize: 13, color: AppTheme.textSecondary),
               )
             : null,
@@ -407,13 +438,28 @@ class _ChatDetailScreenState extends State<ChatDetailScreen> {
         actionsAlignment: MainAxisAlignment.end,
         actionsPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
         actions: [
-          if (canDeleteForEveryone)
-            TextButton(
+          if (canCopy)
+            TextButton.icon(
+              icon: const Icon(Icons.copy_rounded, size: 18, color: Colors.white),
+              label: const Text(
+                'Copy text',
+                style: TextStyle(color: Colors.white, fontSize: 14),
+              ),
               onPressed: () {
+                Clipboard.setData(ClipboardData(text: message.content));
                 Navigator.pop(dialogCtx);
-                context.read<ChatProvider>().deleteMessageForEveryone(message);
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text('Message copied to clipboard'),
+                    duration: Duration(seconds: 2),
+                  ),
+                );
               },
-              child: const Text(
+            ),
+          if (canDeleteForEveryone)
+            TextButton.icon(
+              icon: const Icon(Icons.delete_sweep_outlined, size: 18, color: AppTheme.torPurpleLight),
+              label: const Text(
                 'Delete for everyone',
                 style: TextStyle(
                   color: AppTheme.torPurpleLight,
@@ -421,19 +467,24 @@ class _ChatDetailScreenState extends State<ChatDetailScreen> {
                   fontSize: 14,
                 ),
               ),
+              onPressed: () {
+                Navigator.pop(dialogCtx);
+                context.read<ChatProvider>().deleteMessageForEveryone(message);
+              },
             ),
-          TextButton(
+          TextButton.icon(
+            icon: const Icon(Icons.delete_outline, size: 18, color: Colors.white70),
+            label: const Text(
+              'Delete for me',
+              style: TextStyle(
+                color: Colors.white70,
+                fontSize: 14,
+              ),
+            ),
             onPressed: () {
               Navigator.pop(dialogCtx);
               context.read<ChatProvider>().deleteMessageForMe(message);
             },
-            child: const Text(
-              'Delete for me',
-              style: TextStyle(
-                color: Colors.white,
-                fontSize: 14,
-              ),
-            ),
           ),
           TextButton(
             onPressed: () => Navigator.pop(dialogCtx),
@@ -461,8 +512,15 @@ class _ChatDetailScreenState extends State<ChatDetailScreen> {
     final pingResult = chatProvider.pingCache[contact.onionAddress];
 
     if (messages.length != _lastMessageCount) {
+      final prevCount = _lastMessageCount;
       _lastMessageCount = messages.length;
-      WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
+      if (prevCount > 0 && messages.length > prevCount) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (_scrollController.hasClients && _scrollController.offset < 120) {
+            _scrollToBottom();
+          }
+        });
+      }
     }
 
     return CallbackShortcuts(
@@ -629,20 +687,30 @@ class _ChatDetailScreenState extends State<ChatDetailScreen> {
                       ],
                     ),
                   )
-                : ListView.builder(
-                    controller: _scrollController,
-                    padding: const EdgeInsets.symmetric(vertical: 16),
-                    itemCount: messages.length,
-                    itemBuilder: (context, index) {
-                      final msg = messages[index];
-                      return ChatBubble(
-                        message: msg,
-                        onRetry: msg.status.name == 'failed'
-                            ? () => chatProvider.retryMessage(msg)
-                            : null,
-                        onDelete: () => _showDeleteMessageDialog(msg),
-                      );
+                : NotificationListener<ScrollNotification>(
+                    onNotification: (notification) {
+                      if (notification is ScrollEndNotification) {
+                        _currentScrollOffset = notification.metrics.pixels;
+                      }
+                      return false;
                     },
+                    child: ListView.builder(
+                      controller: _scrollController,
+                      reverse: true,
+                      padding: const EdgeInsets.symmetric(vertical: 16),
+                      itemCount: messages.length,
+                      itemBuilder: (context, index) {
+                        final msg = messages[messages.length - 1 - index];
+                        return ChatBubble(
+                          key: ValueKey(msg.id),
+                          message: msg,
+                          onRetry: msg.status.name == 'failed'
+                              ? () => chatProvider.retryMessage(msg)
+                              : null,
+                          onDelete: () => _showDeleteMessageDialog(msg),
+                        );
+                      },
+                    ),
                   ),
           ),
 

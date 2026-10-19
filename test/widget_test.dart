@@ -2,6 +2,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:tor_chat/models/contact.dart';
 import 'package:tor_chat/models/identity.dart';
 import 'package:tor_chat/models/message.dart';
+import 'package:tor_chat/providers/chat_provider.dart';
 
 void main() {
   group('Models & Cryptographic Key Serialization Tests', () {
@@ -120,6 +121,23 @@ void main() {
 
       final payload = deletedMsg.toNetworkPayload();
       expect(payload['is_deleted'], 1);
+    });
+
+    test('ChatScrollState preserves offset and latest message timestamp', () {
+      final now = DateTime.now();
+      const scrollState = ChatScrollState(
+        offset: 450.5,
+        lastMessageTimestamp: null,
+      );
+      expect(scrollState.offset, 450.5);
+      expect(scrollState.lastMessageTimestamp, isNull);
+
+      final withTime = ChatScrollState(
+        offset: 320.0,
+        lastMessageTimestamp: now,
+      );
+      expect(withTime.offset, 320.0);
+      expect(withTime.lastMessageTimestamp, now);
     });
   });
 }

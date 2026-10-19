@@ -55,11 +55,16 @@ class ChatCoordinator {
   BackupService get backupService => _backup;
   UserIdentity? get activeIdentity => _activeIdentity;
   Stream<ChatMessage> get incomingMessages => _incomingMessageController.stream;
+  final _sentMessageController = StreamController<ChatMessage>.broadcast();
+  Stream<ChatMessage> get sentMessages => _sentMessageController.stream;
   Stream<Map<String, dynamic>> get receipts => _receiptController.stream;
   Stream<String> get chatSelectionRequests => _chatSelectionController.stream;
+  final _resetToInboxController = StreamController<void>.broadcast();
+  Stream<void> get resetToInboxRequests => _resetToInboxController.stream;
   Stream<Map<String, String>> get messageDeletions => _messageDeletedController.stream;
   Stream<TorStatus> get torStatusStream => _torManager.statusStream;
   TorStatus get torStatus => _torManager.status;
+  final Map<String, LocalNotification> _activeWindowsNotifications = {};
 
   String? activeChatOnion;
   bool isAppInForeground = true;
@@ -86,25 +91,7 @@ class ChatCoordinator {
   }) async {
     if (messageIds.isEmpty) return;
     await _db.addPendingReadReceipts(peerOnion, messageIds);
-    unawaited(_sendReceiptsDirectly(peerOnion, messageIds));
     _processOutbox(targetPeer: peerOnion);
-  }
-
-  Future<void> _sendReceiptsDirectly(String peerOnion, List<String> messageIds) async {
-    try {
-      final ok = await _peerClient.sendReceipt(
-        peerOnion: peerOnion,
-        messageIds: messageIds,
-        status: MessageStatus.read,
-        timeout: const Duration(seconds: 25),
-      );
-      if (ok) {
-        await _db.removePendingReadReceipts(messageIds);
-        _torManager.addExternalLog('[notice] Delivered ${messageIds.length} read receipts directly to $peerOnion');
-      }
-    } catch (_) {
-      // Ignored: _processPendingReceipts in outbox worker will retry automatically
-    }
   }
 
   /// Full startup flow: launches Tor, connects Control Port, sets up Onion Service & P2P Server
@@ -141,13 +128,27 @@ class ChatCoordinator {
     // 6. Start Outbox background retry worker
     _startOutboxWorker();
 
-    // 7. Listen for Android native notifications click
+    // 7. Listen for Android native notifications click and reset to inbox
     if (Platform.isAndroid) {
       const MethodChannel('com.onionchat.tor_chat/native').setMethodCallHandler((call) async {
         if (call.method == 'onSelectChat') {
           final chatOnion = call.arguments as String?;
           if (chatOnion != null && chatOnion.isNotEmpty) {
             _chatSelectionController.add(chatOnion);
+          }
+        } else if (call.method == 'onResetToInbox') {
+          _resetToInboxController.add(null);
+        } else if (call.method == 'onNotificationReply') {
+          final args = call.arguments as Map<dynamic, dynamic>?;
+          if (args != null) {
+            final chatOnion = args['chatOnion'] as String?;
+            final content = args['content'] as String?;
+            if (chatOnion != null && content != null && content.trim().isNotEmpty) {
+              await sendMessage(
+                recipientOnion: chatOnion,
+                content: content.trim(),
+              );
+            }
           }
         }
       });
@@ -259,10 +260,21 @@ class ChatCoordinator {
           } catch (_) {}
         } else if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
           try {
+            final cleanOnion = msg.chatOnion.trim().toLowerCase();
+            final oldNotification = _activeWindowsNotifications[cleanOnion];
+            if (oldNotification != null) {
+              try {
+                await oldNotification.close();
+              } catch (_) {}
+            }
+
             final notification = LocalNotification(
-              identifier: '${msg.id}_${DateTime.now().millisecondsSinceEpoch}',
+              identifier: 'chat_$cleanOnion',
               title: displayName,
               body: summaryText,
+              actions: [
+                LocalNotificationAction(text: 'Reply'),
+              ],
             );
             notification.onClick = () async {
               await windowManager.show();
@@ -271,6 +283,14 @@ class ChatCoordinator {
               isWindowFocused = true;
               _chatSelectionController.add(msg.chatOnion);
             };
+            notification.onClickAction = (actionIndex) async {
+              await windowManager.show();
+              await windowManager.focus();
+              isWindowVisible = true;
+              isWindowFocused = true;
+              _chatSelectionController.add(msg.chatOnion);
+            };
+            _activeWindowsNotifications[cleanOnion] = notification;
             await notification.show();
           } catch (e) {
             _torManager.addExternalLog('[warn] Desktop notification error: $e');
@@ -303,7 +323,7 @@ class ChatCoordinator {
 
   Timer? _outboxTimer;
   bool _isProcessingOutbox = false;
-  bool _needsAnotherRun = false;
+  final Set<String?> _pendingOutboxTargets = {};
 
   void _startOutboxWorker() {
     _outboxTimer?.cancel();
@@ -353,6 +373,7 @@ class ChatCoordinator {
 
     // Trigger Outbox processing immediately
     _processOutbox(targetPeer: cleanRecipient);
+    _sentMessageController.add(msg);
 
     return msg;
   }
@@ -411,24 +432,57 @@ class ChatCoordinator {
 
     // Trigger Outbox processing immediately
     _processOutbox(targetPeer: cleanRecipient);
+    _sentMessageController.add(msg);
 
     return msg;
   }
 
+  /// Cancels and removes the active notification for this chat
+  void dismissNotification(String chatOnion) {
+    final cleanOnion = chatOnion.trim().toLowerCase();
+    if (Platform.isAndroid) {
+      try {
+        const MethodChannel('com.onionchat.tor_chat/native').invokeMethod(
+          'dismissNotification',
+          {'chatOnion': cleanOnion},
+        );
+      } catch (_) {}
+    } else if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
+      final old = _activeWindowsNotifications.remove(cleanOnion);
+      if (old != null) {
+        try {
+          old.close();
+        } catch (_) {}
+      }
+    }
+  }
+
   Future<void> _processOutbox({String? targetPeer}) async {
+    _pendingOutboxTargets.add(targetPeer);
     if (_isProcessingOutbox) {
-      _needsAnotherRun = true;
       return;
     }
     _isProcessingOutbox = true;
 
     try {
-      do {
-        _needsAnotherRun = false;
-        await _processPendingOutgoingMessages(targetPeer: targetPeer);
-        await _processPendingReceipts(targetPeer: targetPeer);
-        await _processPendingDeletes(targetPeer: targetPeer);
-      } while (_needsAnotherRun);
+      while (_pendingOutboxTargets.isNotEmpty) {
+        final targets = Set<String?>.from(_pendingOutboxTargets);
+        _pendingOutboxTargets.clear();
+
+        if (targets.contains(null)) {
+          await _processPendingOutgoingMessages();
+          await _processPendingReceipts();
+          await _processPendingDeletes();
+        } else {
+          for (final peer in targets) {
+            if (peer != null) {
+              await _processPendingOutgoingMessages(targetPeer: peer);
+              await _processPendingReceipts(targetPeer: peer);
+              await _processPendingDeletes(targetPeer: peer);
+            }
+          }
+        }
+      }
     } finally {
       _isProcessingOutbox = false;
     }
@@ -478,7 +532,6 @@ class ChatCoordinator {
           } catch (e) {
             _torManager.addExternalLog('[notice] Peer $peerOnion unreachable ($e). Kept in queue for infinite auto-retry.');
             _socks5.invalidatePeer(peerOnion);
-            _torControl.signalNewNym();
             // Do not mark failed; keep in sending so background worker retries infinitely
             break;
           }
@@ -512,11 +565,9 @@ class ChatCoordinator {
             _torManager.addExternalLog('[notice] Delivered ${ids.length} read receipts to $peerOnion');
           } else {
             _socks5.invalidatePeer(peerOnion);
-            _torControl.signalNewNym();
           }
         } catch (_) {
           _socks5.invalidatePeer(peerOnion);
-          _torControl.signalNewNym();
         }
       }
     } catch (_) {}
@@ -547,11 +598,9 @@ class ChatCoordinator {
               _torManager.addExternalLog('[notice] Delivered queued delete for $msgId to $peerOnion');
             } else {
               _socks5.invalidatePeer(peerOnion);
-              _torControl.signalNewNym();
             }
           } catch (_) {
             _socks5.invalidatePeer(peerOnion);
-            _torControl.signalNewNym();
           }
         }
       }
@@ -574,29 +623,8 @@ class ChatCoordinator {
     // 2. Queue in pending_deletes for persistent guaranteed delivery
     await _db.addPendingDelete(message.recipientOnion, message.id);
 
-    // 3. Immediately attempt direct delivery over Tor
-    unawaited(_sendDeleteDirectly(message.recipientOnion, message.id));
-
-    // 4. Trigger Outbox worker
+    // 3. Trigger Outbox worker immediately
     _processOutbox(targetPeer: message.recipientOnion);
-  }
-
-  Future<void> _sendDeleteDirectly(String peerOnion, String messageId) async {
-    if (_activeIdentity == null) return;
-    try {
-      final ok = await _peerClient.sendDeleteMessage(
-        peerOnion: peerOnion,
-        messageId: messageId,
-        myOnion: _activeIdentity!.onionAddress,
-        timeout: const Duration(seconds: 25),
-      );
-      if (ok) {
-        await _db.removePendingDelete(messageId);
-        _torManager.addExternalLog('[notice] Delivered delete-for-everyone for $messageId directly to $peerOnion');
-      }
-    } catch (_) {
-      // Ignored: _processPendingDeletes will retry in background
-    }
   }
 
   /// Retries sending a previously failed message

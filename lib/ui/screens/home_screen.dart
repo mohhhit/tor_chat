@@ -26,6 +26,7 @@ class _HomeScreenState extends State<HomeScreen> {
   final TextEditingController _searchController = TextEditingController();
   String _searchFilter = '';
   StreamSubscription<String>? _chatNavSub;
+  StreamSubscription<void>? _resetToInboxSub;
 
   @override
   void initState() {
@@ -35,6 +36,15 @@ class _HomeScreenState extends State<HomeScreen> {
       if (mounted) {
         context.read<ChatProvider>().selectChat(null);
       }
+    });
+
+    _resetToInboxSub = ChatCoordinator.instance.resetToInboxRequests.listen((_) {
+      if (!mounted) return;
+      final isWide = MediaQuery.of(context).size.width >= 750;
+      if (!isWide) {
+        Navigator.of(context).popUntil((route) => route.isFirst);
+      }
+      context.read<ChatProvider>().selectChat(null);
     });
 
     _chatNavSub = ChatCoordinator.instance.chatSelectionRequests.listen((chatOnion) async {
@@ -48,6 +58,7 @@ class _HomeScreenState extends State<HomeScreen> {
       if (contact != null && mounted) {
         final isWide = MediaQuery.of(context).size.width >= 750;
         if (!isWide) {
+          Navigator.of(context).popUntil((route) => route.isFirst);
           Navigator.push(
             context,
             MaterialPageRoute(
@@ -56,6 +67,8 @@ class _HomeScreenState extends State<HomeScreen> {
           ).then((_) {
             chatProvider.selectChat(null);
           });
+        } else {
+          chatProvider.selectChat(contact);
         }
       }
     });
@@ -64,6 +77,7 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void dispose() {
     _chatNavSub?.cancel();
+    _resetToInboxSub?.cancel();
     _searchController.dispose();
     super.dispose();
   }
