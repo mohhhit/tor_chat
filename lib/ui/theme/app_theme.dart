@@ -4,7 +4,9 @@ class AppTheme {
   static const Color torPurple = Color(0xFF7D4698);
   static const Color torPurpleLight = Color(0xFFA45EE5);
   static const Color background = Color(0xFF10121A);
+  static const Color bgDark = Color(0xFF10121A);
   static const Color surface = Color(0xFF1A1C28);
+  static const Color surfaceDark = Color(0xFF1A1C28);
   static const Color cardColor = Color(0xFF222536);
   static const Color cardBorder = Color(0xFF2E3247);
   static const Color textPrimary = Color(0xFFEDEDF4);

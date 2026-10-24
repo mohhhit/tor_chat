@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math';
 import 'package:flutter/services.dart';
 import 'package:local_notifier/local_notifier.dart';
 import 'package:path/path.dart' as p;
@@ -53,6 +54,10 @@ class ChatCoordinator {
   TorProcessManager get torManager => _torManager;
   TorControlClient get torControl => _torControl;
   BackupService get backupService => _backup;
+  PeerClient get peerClient => _peerClient;
+  PeerServer? get peerServer => _peerServer;
+  DatabaseHelper get databaseHelper => _db;
+  void Function(PeerServer srv)? onServerStarted;
   UserIdentity? get activeIdentity => _activeIdentity;
   Stream<ChatMessage> get incomingMessages => _incomingMessageController.stream;
   final _sentMessageController = StreamController<ChatMessage>.broadcast();
@@ -64,6 +69,17 @@ class ChatCoordinator {
   Stream<Map<String, String>> get messageDeletions => _messageDeletedController.stream;
   Stream<TorStatus> get torStatusStream => _torManager.statusStream;
   TorStatus get torStatus => _torManager.status;
+
+  void Function(String? callId, String? chatOnion)? onNativeAcceptCall;
+  void Function(String? callId)? onNativeDeclineCall;
+
+  void notifyMessageLogged(ChatMessage msg) {
+    if (msg.isOutgoing) {
+      _sentMessageController.add(msg);
+    } else {
+      _incomingMessageController.add(msg);
+    }
+  }
   final Map<String, LocalNotification> _activeWindowsNotifications = {};
 
   String? activeChatOnion;
@@ -125,10 +141,21 @@ class ChatCoordinator {
     // 5. Start incoming P2P Server
     await _startPeerServer();
 
-    // 6. Start Outbox background retry worker
+    // 6. Start Outbox background retry worker & keep-alive heartbeat
     _startOutboxWorker();
+    _startKeepAliveHeartbeat();
 
-    // 7. Listen for Android native notifications click and reset to inbox
+    // 7. Pre-warm known contacts as soon as Tor reaches 100% bootstrap
+    _torManager.statusStream.listen((status) {
+      if (status.isReady) {
+        _prewarmAllContacts();
+      }
+    });
+    if (_torManager.status.isReady) {
+      _prewarmAllContacts();
+    }
+
+    // 8. Listen for Android native notifications click and reset to inbox
     if (Platform.isAndroid) {
       const MethodChannel('com.onionchat.tor_chat/native').setMethodCallHandler((call) async {
         if (call.method == 'onSelectChat') {
@@ -150,6 +177,15 @@ class ChatCoordinator {
               );
             }
           }
+        } else if (call.method == 'onAcceptCall') {
+          final args = call.arguments as Map<dynamic, dynamic>?;
+          final callId = args?['callId'] as String?;
+          final chatOnion = args?['chatOnion'] as String?;
+          onNativeAcceptCall?.call(callId, chatOnion);
+        } else if (call.method == 'onDeclineCall') {
+          final args = call.arguments as Map<dynamic, dynamic>?;
+          final callId = args?['callId'] as String?;
+          onNativeDeclineCall?.call(callId);
         }
       });
     }
@@ -157,20 +193,27 @@ class ChatCoordinator {
 
   Future<void> _setupOnionService() async {
     try {
+      final existingKey = (_activeIdentity?.privateKey.isNotEmpty == true &&
+              !_activeIdentity!.onionAddress.startsWith('pending_'))
+          ? _activeIdentity?.privateKey
+          : null;
+
       final OnionServiceResult onionRes = await _torControl.addOnion(
         virtualPort: 80,
         targetPort: _localServerPort,
-        existingPrivateKey: _activeIdentity?.privateKey,
+        existingPrivateKey: existingKey,
       );
 
       final fullAddress = onionRes.fullOnionAddress;
 
-      if (_activeIdentity == null) {
-        // First-time user: persist generated identity
+      if (_activeIdentity == null || _activeIdentity!.onionAddress.startsWith('pending_')) {
+        // First-time user or resolving previously pending: persist generated identity
         _activeIdentity = UserIdentity(
           onionAddress: fullAddress,
           privateKey: onionRes.privateKey,
-          nickname: 'Anon_${fullAddress.substring(0, 6)}',
+          nickname: (_activeIdentity != null && _activeIdentity!.nickname.isNotEmpty)
+              ? _activeIdentity!.nickname
+              : 'Anon_${fullAddress.substring(0, 6)}',
         );
         await _db.saveIdentity(_activeIdentity!);
       } else {
@@ -186,7 +229,18 @@ class ChatCoordinator {
       if (e.toString().contains('550') || e.toString().contains('collision')) {
         _torManager.addExternalLog('[notice] Onion service already active on Tor daemon.');
       } else {
-        _torManager.addExternalLog('[error] Failed to register Onion Service: $e');
+        _torManager.addExternalLog('[error] Failed to register Onion Service via ControlPort ($e). If on Android, please enable "Tor Control: 9051" in Orbot Settings.');
+        // If identity is null, create a temporary pending identity so local UI & outgoing messaging still function
+        if (_activeIdentity == null) {
+          final randomBytes = List<int>.generate(16, (_) => Random.secure().nextInt(256));
+          final idHex = randomBytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+          _activeIdentity = UserIdentity(
+            onionAddress: 'pending_$idHex.onion',
+            privateKey: '',
+            nickname: 'Anon_${idHex.substring(0, 6)}',
+          );
+          await _db.saveIdentity(_activeIdentity!);
+        }
       }
     }
   }
@@ -319,11 +373,17 @@ class ChatCoordinator {
     };
 
     await _peerServer!.start();
+    onServerStarted?.call(_peerServer!);
   }
 
   Timer? _outboxTimer;
-  bool _isProcessingOutbox = false;
-  final Set<String?> _pendingOutboxTargets = {};
+  Timer? _keepAliveTimer;
+  final Set<String> _activeOutboxPeers = {};
+  bool _isProcessingGlobalOutbox = false;
+  final Set<String> _pendingPeerRetries = {};
+  final Map<String, int> _failCount = {};
+  final Map<String, Timer> _peerRetryTimers = {};
+  bool _hasPrewarmedInitialContacts = false;
 
   void _startOutboxWorker() {
     _outboxTimer?.cancel();
@@ -332,6 +392,92 @@ class ChatCoordinator {
     });
     // Run immediately on launch
     _processOutbox();
+  }
+
+  /// Sends a tiny HTTP ping every 25s for the currently active chat so carrier NAT and circuits don't die
+  void _startKeepAliveHeartbeat() {
+    _keepAliveTimer?.cancel();
+    _keepAliveTimer = Timer.periodic(const Duration(seconds: 25), (_) async {
+      final currentChat = activeChatOnion;
+      if (currentChat != null && currentChat.isNotEmpty && isAppInForeground) {
+        try {
+          await _peerClient.pingPeer(currentChat, timeout: const Duration(seconds: 10));
+        } catch (_) {}
+      }
+    });
+  }
+
+  /// Pre-warms circuits to active/recent contacts after Tor bootstraps to 100%
+  Future<void> _prewarmAllContacts() async {
+    if (_hasPrewarmedInitialContacts) return;
+    _hasPrewarmedInitialContacts = true;
+    try {
+      final currentChat = activeChatOnion;
+      if (currentChat != null && currentChat.isNotEmpty) {
+        _peerClient.prewarmPeer(currentChat);
+      }
+
+      final contacts = await _db.getAllContacts();
+      final activeContacts = contacts
+          .where((c) => c.onionAddress.endsWith('.onion') && c.lastMessage != null && c.onionAddress != currentChat)
+          .take(2);
+
+      for (final contact in activeContacts) {
+        await Future.delayed(const Duration(seconds: 4));
+        _peerClient.prewarmPeer(contact.onionAddress);
+      }
+    } catch (e) {
+      _torManager.addExternalLog('[warn] Prewarm contacts error: $e');
+    }
+  }
+
+  /// Exponential backoff delay for retrying an unreachable peer (steps: 2, 4, 8, 15, 30s)
+  Duration _retryDelay(String peer) {
+    final n = _failCount[peer] ?? 0;
+    const steps = [2, 4, 8, 15, 30]; // seconds
+    return Duration(seconds: steps[n.clamp(0, steps.length - 1)]);
+  }
+
+  /// Schedules an expedited retry for a specific peer after backoff delay
+  void _schedulePeerRetry(String peer) {
+    _peerRetryTimers[peer]?.cancel();
+    final delay = _retryDelay(peer);
+    _torManager.addExternalLog('[notice] Outbox: Scheduling retry for $peer in ${delay.inSeconds}s (attempt #${_failCount[peer]})');
+    _peerRetryTimers[peer] = Timer(delay, () {
+      _peerRetryTimers.remove(peer);
+      _processOutbox(targetPeer: peer);
+    });
+  }
+
+  /// Wakes Tor and prewarms circuits when the app returns from background
+  Future<void> wakeTor() async {
+    try {
+      if (!_torManager.status.isReady) {
+        // Tor was not connected or was in error; try initializing again
+        await initialize();
+        return;
+      }
+      await _torControl.wake();
+      final currentChat = activeChatOnion;
+      if (currentChat != null && currentChat.isNotEmpty) {
+        _peerClient.prewarmPeer(currentChat);
+      }
+    } catch (e) {
+      _torManager.addExternalLog('[warn] Wake Tor error: $e');
+    }
+  }
+
+  /// Flushes circuits and wakes Tor when network connection changes (Wi-Fi <-> Cellular)
+  Future<void> onNetworkChanged() async {
+    try {
+      await _torControl.onNetworkChanged();
+      final currentChat = activeChatOnion;
+      if (currentChat != null && currentChat.isNotEmpty) {
+        _peerClient.prewarmPeer(currentChat);
+      }
+    } catch (e) {
+      _torManager.addExternalLog('[warn] Network change error: $e');
+    }
   }
 
   /// Pre-warms the Tor connection to the selected peer in the background
@@ -370,6 +516,11 @@ class ChatCoordinator {
       lastMessage: content,
       timestamp: now,
     );
+
+    // Cancel any delayed backoff timer for this peer so it sends immediately
+    _peerRetryTimers[cleanRecipient]?.cancel();
+    _peerRetryTimers.remove(cleanRecipient);
+    _failCount.remove(cleanRecipient);
 
     // Trigger Outbox processing immediately
     _processOutbox(targetPeer: cleanRecipient);
@@ -430,6 +581,11 @@ class ChatCoordinator {
       timestamp: now,
     );
 
+    // Cancel any delayed backoff timer for this peer so it sends immediately
+    _peerRetryTimers[cleanRecipient]?.cancel();
+    _peerRetryTimers.remove(cleanRecipient);
+    _failCount.remove(cleanRecipient);
+
     // Trigger Outbox processing immediately
     _processOutbox(targetPeer: cleanRecipient);
     _sentMessageController.add(msg);
@@ -458,33 +614,50 @@ class ChatCoordinator {
   }
 
   Future<void> _processOutbox({String? targetPeer}) async {
-    _pendingOutboxTargets.add(targetPeer);
-    if (_isProcessingOutbox) {
-      return;
-    }
-    _isProcessingOutbox = true;
+    if (targetPeer != null) {
+      // Process outbox for this specific peer immediately and independently
+      final cleanPeer = targetPeer.trim();
+      if (_activeOutboxPeers.contains(cleanPeer)) {
+        _pendingPeerRetries.add(cleanPeer);
+        return;
+      }
+      _activeOutboxPeers.add(cleanPeer);
 
-    try {
-      while (_pendingOutboxTargets.isNotEmpty) {
-        final targets = Set<String?>.from(_pendingOutboxTargets);
-        _pendingOutboxTargets.clear();
+      try {
+        do {
+          _pendingPeerRetries.remove(cleanPeer);
+          await _processPendingOutgoingMessages(targetPeer: cleanPeer);
+          await _processPendingReceipts(targetPeer: cleanPeer);
+          await _processPendingDeletes(targetPeer: cleanPeer);
+        } while (_pendingPeerRetries.contains(cleanPeer));
+      } finally {
+        _activeOutboxPeers.remove(cleanPeer);
+      }
+    } else {
+      // Periodic background scan for all peers
+      if (_isProcessingGlobalOutbox) return;
+      _isProcessingGlobalOutbox = true;
 
-        if (targets.contains(null)) {
-          await _processPendingOutgoingMessages();
-          await _processPendingReceipts();
-          await _processPendingDeletes();
-        } else {
-          for (final peer in targets) {
-            if (peer != null) {
-              await _processPendingOutgoingMessages(targetPeer: peer);
-              await _processPendingReceipts(targetPeer: peer);
-              await _processPendingDeletes(targetPeer: peer);
-            }
+      try {
+        final pendingMsgs = await _db.getPendingOutgoingMessages();
+        final pendingReceipts = await _db.getPendingReadReceipts();
+        final pendingDeletes = await _db.getPendingDeletes();
+
+        final allPeers = <String>{
+          ...pendingMsgs.map((m) => m.recipientOnion.trim()),
+          ...pendingReceipts.keys.map((k) => k.trim()),
+          ...pendingDeletes.keys.map((k) => k.trim()),
+        };
+
+        for (final peer in allPeers) {
+          if (peer.isNotEmpty && !_activeOutboxPeers.contains(peer)) {
+            // Process each peer in background without blocking others
+            unawaited(_processOutbox(targetPeer: peer));
           }
         }
+      } finally {
+        _isProcessingGlobalOutbox = false;
       }
-    } finally {
-      _isProcessingOutbox = false;
     }
   }
 
@@ -521,8 +694,12 @@ class ChatCoordinator {
               peerOnion: peerOnion,
               message: msg,
               myNickname: _activeIdentity?.nickname ?? 'Anonymous',
-              timeout: const Duration(seconds: 30),
             );
+
+            // Clear fail count on success
+            _failCount.remove(peerOnion);
+            _peerRetryTimers[peerOnion]?.cancel();
+            _peerRetryTimers.remove(peerOnion);
 
             final updated = await _db.updateMessageStatus(msg.id, confirmedStatus);
             if (updated) {
@@ -530,9 +707,11 @@ class ChatCoordinator {
             }
             _torManager.addExternalLog('[notice] Message ${msg.id.substring(0, 8)} confirmed: ${confirmedStatus.name}!');
           } catch (e) {
-            _torManager.addExternalLog('[notice] Peer $peerOnion unreachable ($e). Kept in queue for infinite auto-retry.');
+            _torManager.addExternalLog('[notice] Peer $peerOnion unreachable ($e). Kept in queue for auto-retry.');
             _socks5.invalidatePeer(peerOnion);
-            // Do not mark failed; keep in sending so background worker retries infinitely
+            _failCount[peerOnion] = (_failCount[peerOnion] ?? 0) + 1;
+            _schedulePeerRetry(peerOnion);
+            // Do not mark failed; keep in sending so background worker retries
             break;
           }
         }
@@ -558,7 +737,6 @@ class ChatCoordinator {
             peerOnion: peerOnion,
             messageIds: ids,
             status: MessageStatus.read,
-            timeout: const Duration(seconds: 25),
           );
           if (ok) {
             await _db.removePendingReadReceipts(ids);
@@ -591,7 +769,6 @@ class ChatCoordinator {
               peerOnion: peerOnion,
               messageId: msgId,
               myOnion: _activeIdentity!.onionAddress,
-              timeout: const Duration(seconds: 25),
             );
             if (ok) {
               await _db.removePendingDelete(msgId);
@@ -716,12 +893,21 @@ class ChatCoordinator {
 
   /// Shuts down all components cleanly
   Future<void> dispose() async {
+    _outboxTimer?.cancel();
+    _keepAliveTimer?.cancel();
+    for (final timer in _peerRetryTimers.values) {
+      timer.cancel();
+    }
+    _peerRetryTimers.clear();
+    await _socks5.closeAll();
     await _peerServer?.stop();
     await _torControl.disconnect();
     await _torManager.stopTor();
     await _incomingMessageController.close();
+    await _sentMessageController.close();
     await _receiptController.close();
     await _chatSelectionController.close();
+    await _resetToInboxController.close();
     await _messageDeletedController.close();
   }
 }

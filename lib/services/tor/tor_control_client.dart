@@ -166,6 +166,23 @@ class TorControlClient {
     } catch (_) {}
   }
 
+  /// Wakes Tor up from any dormant state immediately
+  Future<void> wake() async {
+    try {
+      await sendCommand('SIGNAL ACTIVE');
+    } catch (_) {}
+  }
+
+  /// Rebinds Tor networking when interface or connection changes (e.g. WiFi <-> Cellular)
+  Future<void> onNetworkChanged() async {
+    try {
+      await sendCommand('SETCONF DisableNetwork=1');
+      await Future.delayed(const Duration(milliseconds: 300));
+      await sendCommand('SETCONF DisableNetwork=0');
+      await wake();
+    } catch (_) {}
+  }
+
   /// Get current bootstrap progress info
   Future<int> getBootstrapProgress() async {
     try {

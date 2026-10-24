@@ -49,6 +49,8 @@ dependencies:
   tray_manager: ^0.2.4
   local_notifier: ^0.1.6
   image_picker: ^1.2.4
+  record: ^7.1.2
+  audioplayers: ^6.8.1
 
 dev_dependencies:
   flutter_test:

@@ -65,7 +65,101 @@ class _ChatBubbleState extends State<ChatBubble> {
     final message = widget.message;
     final isOut = message.isOutgoing;
     final isImage = message.messageType == MessageType.image && message.mediaPath != null;
+    final isCall = message.messageType == MessageType.call;
     final timeStr = DateFormat('HH:mm').format(message.timestamp);
+
+    // Call Log Entry in Timeline
+    if (isCall && !message.isDeleted) {
+      final isMissed = message.content.toLowerCase().contains('missed') ||
+          message.content.toLowerCase().contains('unanswered') ||
+          message.content.toLowerCase().contains('declined') ||
+          message.content.toLowerCase().contains('busy');
+      final callText = message.content.replaceFirst('📞 ', '');
+
+      return Align(
+        alignment: isOut ? Alignment.centerRight : Alignment.centerLeft,
+        child: GestureDetector(
+          onLongPress: widget.onDelete,
+          onSecondaryTap: widget.onDelete,
+          child: Container(
+            margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+            constraints: BoxConstraints(
+              maxWidth: MediaQuery.of(context).size.width * 0.75,
+            ),
+            decoration: BoxDecoration(
+              color: isOut ? AppTheme.torPurple.withValues(alpha: 0.6) : AppTheme.cardColor,
+              borderRadius: BorderRadius.only(
+                topLeft: const Radius.circular(16),
+                topRight: const Radius.circular(16),
+                bottomLeft: Radius.circular(isOut ? 16 : 4),
+                bottomRight: Radius.circular(isOut ? 4 : 16),
+              ),
+              border: Border.all(
+                color: isMissed
+                    ? AppTheme.errorRed.withValues(alpha: 0.4)
+                    : (isOut ? AppTheme.torPurpleLight.withValues(alpha: 0.4) : AppTheme.cardBorder),
+              ),
+            ),
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    color: isMissed
+                        ? AppTheme.errorRed.withValues(alpha: 0.15)
+                        : (isOut ? AppTheme.torPurpleLight.withValues(alpha: 0.2) : AppTheme.surface),
+                    shape: BoxShape.circle,
+                  ),
+                  child: Icon(
+                    isMissed
+                        ? Icons.phone_missed_rounded
+                        : (isOut ? Icons.phone_forwarded_rounded : Icons.phone_callback_rounded),
+                    color: isMissed ? AppTheme.errorRed : (isOut ? Colors.white : AppTheme.onlineGreen),
+                    size: 18,
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Flexible(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        callText,
+                        style: TextStyle(
+                          fontSize: 14,
+                          fontWeight: FontWeight.w600,
+                          color: isMissed && !isOut ? AppTheme.errorRed : AppTheme.textPrimary,
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            isOut ? 'Outgoing' : 'Incoming',
+                            style: const TextStyle(fontSize: 11, color: AppTheme.textSecondary),
+                          ),
+                          const SizedBox(width: 6),
+                          const Text('•', style: TextStyle(fontSize: 10, color: AppTheme.textSecondary)),
+                          const SizedBox(width: 6),
+                          Text(
+                            timeStr,
+                            style: const TextStyle(fontSize: 11, color: AppTheme.textSecondary),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
 
     // WhatsApp-style Deleted Message Tombstone
     if (message.isDeleted) {

@@ -5,7 +5,11 @@ import 'package:image_picker/image_picker.dart';
 import 'package:provider/provider.dart';
 import '../../models/contact.dart';
 import '../../models/message.dart';
+import '../../providers/call_provider.dart';
 import '../../providers/chat_provider.dart';
+import '../../providers/tor_provider.dart';
+import '../../services/p2p/chat_coordinator.dart';
+import 'active_call_screen.dart';
 import '../theme/app_theme.dart';
 import '../widgets/chat_bubble.dart';
 
@@ -30,6 +34,7 @@ class _ChatDetailScreenState extends State<ChatDetailScreen> {
   @override
   void initState() {
     super.initState();
+    ChatCoordinator.instance.prewarmPeerConnection(widget.contact.onionAddress);
     final cp = context.read<ChatProvider>();
     final saved = cp.getScrollState(widget.contact.onionAddress);
 
@@ -116,9 +121,22 @@ class _ChatDetailScreenState extends State<ChatDetailScreen> {
     if (text.isEmpty) return;
     _textController.clear();
 
-    await context.read<ChatProvider>().sendMessage(text, recipientOnion: widget.contact.onionAddress);
-    _scrollToBottom();
-    _focusNode.requestFocus();
+    try {
+      await context.read<ChatProvider>().sendMessage(text, recipientOnion: widget.contact.onionAddress);
+      _scrollToBottom();
+      _focusNode.requestFocus();
+    } catch (e) {
+      if (mounted) {
+        _textController.text = text; // restore unsent text so user doesn't lose it
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Cannot send message: $e'),
+            backgroundColor: AppTheme.errorRed,
+            duration: const Duration(seconds: 4),
+          ),
+        );
+      }
+    }
   }
 
   void _showAttachmentSheet() {
@@ -598,6 +616,48 @@ class _ChatDetailScreenState extends State<ChatDetailScreen> {
             ),
           ),
           actions: [
+            IconButton(
+              icon: const Icon(Icons.call_rounded, color: AppTheme.torPurpleLight),
+              tooltip: 'Start Tor Voice Call',
+              onPressed: () async {
+                final torProvider = context.read<TorProvider>();
+                if (!torProvider.status.isReady) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text(
+                        'Tor network is still connecting (${torProvider.status.bootstrapProgress}%). Please wait.',
+                      ),
+                      backgroundColor: AppTheme.warningAmber,
+                    ),
+                  );
+                  return;
+                }
+
+                final callProvider = context.read<CallProvider>();
+                if (callProvider.hasActiveCall) {
+                  if (callProvider.currentCall?.peerOnion.toLowerCase() ==
+                      contact.onionAddress.toLowerCase()) {
+                    Navigator.of(context).push(
+                      MaterialPageRoute(builder: (_) => const ActiveCallScreen()),
+                    );
+                    return;
+                  }
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('A call with another peer is already in progress')),
+                  );
+                  return;
+                }
+                await callProvider.startCall(
+                  peerOnion: contact.onionAddress,
+                  peerNickname: contact.nickname,
+                );
+                if (context.mounted) {
+                  Navigator.of(context).push(
+                    MaterialPageRoute(builder: (_) => const ActiveCallScreen()),
+                  );
+                }
+              },
+            ),
             IconButton(
               icon: _isPinging
                   ? const SizedBox(

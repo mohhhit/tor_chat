@@ -45,6 +45,7 @@ class TorStatus {
   });
 
   bool get isConnected => state == TorConnectionState.connected;
+  bool get isReady => isConnected || bootstrapProgress >= 100;
 
   TorStatus copyWith({
     TorConnectionState? state,

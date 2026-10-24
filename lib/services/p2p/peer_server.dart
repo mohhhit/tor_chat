@@ -8,6 +8,11 @@ import 'chat_coordinator.dart';
 typedef OnMessageReceived = Future<MessageStatus?> Function(ChatMessage message, String? senderNickname);
 typedef OnReceiptReceived = Future<void> Function(String messageId, MessageStatus status);
 typedef OnMessageDeleted = Future<void> Function(String messageId, String senderOnion);
+typedef OnCallInviteReceived = Future<Map<String, dynamic>> Function(Map<String, dynamic> data);
+typedef OnCallAcceptReceived = Future<void> Function(Map<String, dynamic> data);
+typedef OnCallRejectReceived = Future<void> Function(String callId, String reason);
+typedef OnCallHangupReceived = Future<void> Function(String callId);
+typedef OnCallStreamUpgrade = Future<void> Function(WebSocket socket, String callId);
 
 class PeerServer {
   final int port;
@@ -17,6 +22,11 @@ class PeerServer {
   OnMessageReceived? onMessageReceived;
   OnReceiptReceived? onReceiptReceived;
   OnMessageDeleted? onMessageDeleted;
+  OnCallInviteReceived? onCallInviteReceived;
+  OnCallAcceptReceived? onCallAcceptReceived;
+  OnCallRejectReceived? onCallRejectReceived;
+  OnCallHangupReceived? onCallHangupReceived;
+  OnCallStreamUpgrade? onCallStreamUpgrade;
 
   PeerServer({
     this.port = 8765,
@@ -148,6 +158,63 @@ class PeerServer {
           }
         }
 
+        _sendJsonResponse(request, HttpStatus.ok, {'status': 'ok'});
+        return;
+      }
+
+      // Voice Call Media Stream Upgrade
+      if (path == '/api/v1/call/stream') {
+        if (WebSocketTransformer.isUpgradeRequest(request)) {
+          final callId = request.uri.queryParameters['call_id'] ?? '';
+          final socket = await WebSocketTransformer.upgrade(request);
+          if (onCallStreamUpgrade != null) {
+            await onCallStreamUpgrade!(socket, callId);
+          }
+          return;
+        }
+      }
+
+      // Voice Call Signaling Endpoints
+      if (request.method == 'POST' && path == '/api/v1/call/invite') {
+        final bodyStr = await utf8.decoder.bind(request).join();
+        final Map<String, dynamic> data = jsonDecode(bodyStr);
+        Map<String, dynamic> reply = {'status': 'ringing'};
+        if (onCallInviteReceived != null) {
+          reply = await onCallInviteReceived!(data);
+        }
+        _sendJsonResponse(request, HttpStatus.ok, reply);
+        return;
+      }
+
+      if (request.method == 'POST' && path == '/api/v1/call/accept') {
+        final bodyStr = await utf8.decoder.bind(request).join();
+        final Map<String, dynamic> data = jsonDecode(bodyStr);
+        if (onCallAcceptReceived != null) {
+          await onCallAcceptReceived!(data);
+        }
+        _sendJsonResponse(request, HttpStatus.ok, {'status': 'ok'});
+        return;
+      }
+
+      if (request.method == 'POST' && path == '/api/v1/call/reject') {
+        final bodyStr = await utf8.decoder.bind(request).join();
+        final Map<String, dynamic> data = jsonDecode(bodyStr);
+        final callId = data['call_id'] as String? ?? '';
+        final reason = data['reason'] as String? ?? 'declined';
+        if (onCallRejectReceived != null) {
+          await onCallRejectReceived!(callId, reason);
+        }
+        _sendJsonResponse(request, HttpStatus.ok, {'status': 'ok'});
+        return;
+      }
+
+      if (request.method == 'POST' && path == '/api/v1/call/hangup') {
+        final bodyStr = await utf8.decoder.bind(request).join();
+        final Map<String, dynamic> data = jsonDecode(bodyStr);
+        final callId = data['call_id'] as String? ?? '';
+        if (onCallHangupReceived != null) {
+          await onCallHangupReceived!(callId);
+        }
         _sendJsonResponse(request, HttpStatus.ok, {'status': 'ok'});
         return;
       }

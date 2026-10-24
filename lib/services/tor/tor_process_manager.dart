@@ -142,9 +142,16 @@ class TorProcessManager {
 
     // First check if an existing Tor daemon (e.g. Orbot on Android or system Tor daemon) is already running
     try {
-      final testSock = await Socket.connect('127.0.0.1', controlPort, timeout: const Duration(seconds: 1));
-      testSock.destroy();
-      _addLog('[notice] Detected existing Tor service running on ControlPort $controlPort (e.g. Orbot/daemon)');
+      try {
+        final testSock = await Socket.connect('127.0.0.1', controlPort, timeout: const Duration(seconds: 2));
+        testSock.destroy();
+        _addLog('[notice] Detected existing Tor service running on ControlPort $controlPort (e.g. Orbot/daemon)');
+      } catch (_) {
+        // Fallback: check if SocksPort is open (Orbot VPN / SOCKS proxy mode)
+        final testSock = await Socket.connect('127.0.0.1', socksPort, timeout: const Duration(seconds: 2));
+        testSock.destroy();
+        _addLog('[notice] Detected existing Tor SOCKS proxy running on port $socksPort (e.g. Orbot)');
+      }
       _updateStatus(_status.copyWith(
         state: TorConnectionState.connected,
         bootstrapProgress: 100,
@@ -199,7 +206,19 @@ class TorProcessManager {
         '--CookieAuthentication', '0',
         '--Log', 'notice stdout',
         '--ClientOnly', '1',
+        '--LongLivedPorts', '80',
+        '--DormantCanceledByStartup', '1',
+        '--NumEntryGuards', '3',
       ];
+
+      // Mobile-only Tor optimizations for cellular NAT and IPv6 464XLAT (e.g. Jio / Airtel)
+      if (Platform.isAndroid) {
+        args.addAll([
+          '--KeepalivePeriod', '30',
+          '--ConnectionPadding', '1',
+          '--ClientPreferIPv6ORPort', 'auto',
+        ]);
+      }
 
       _addLog('[notice] Starting Tor with args: ${args.join(" ")}');
 

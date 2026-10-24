@@ -2,7 +2,9 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:tor_chat/models/contact.dart';
 import 'package:tor_chat/models/identity.dart';
 import 'package:tor_chat/models/message.dart';
+import 'package:tor_chat/models/tor_status.dart';
 import 'package:tor_chat/providers/chat_provider.dart';
+import 'package:tor_chat/services/tor/socks5_client.dart';
 
 void main() {
   group('Models & Cryptographic Key Serialization Tests', () {
@@ -138,6 +140,41 @@ void main() {
       );
       expect(withTime.offset, 320.0);
       expect(withTime.lastMessageTimestamp, now);
+    });
+
+    test('TorStatus isReady reports true when connected or bootstrapped', () {
+      const initial = TorStatus();
+      expect(initial.isReady, isFalse);
+
+      final bootstrapping = initial.copyWith(
+        state: TorConnectionState.bootstrapping,
+        bootstrapProgress: 85,
+      );
+      expect(bootstrapping.isReady, isFalse);
+
+      final completedBootstrap = initial.copyWith(
+        state: TorConnectionState.bootstrapping,
+        bootstrapProgress: 100,
+      );
+      expect(completedBootstrap.isReady, isTrue);
+
+      final connected = initial.copyWith(
+        state: TorConnectionState.connected,
+        bootstrapProgress: 100,
+      );
+      expect(connected.isReady, isTrue);
+    });
+
+    test('SocksTimeouts ensures reasonable timeouts and handshake is quick', () {
+      expect(SocksTimeouts.handshake, const Duration(seconds: 10));
+      expect(SocksTimeouts.connectReply, const Duration(seconds: 120));
+      expect(SocksTimeouts.warmConnectReply, const Duration(seconds: 35));
+      expect(SocksTimeouts.httpRequest, const Duration(seconds: 25));
+    });
+
+    test('Socks5Client hasWarmConnection reports false initially', () {
+      final client = Socks5Client();
+      expect(client.hasWarmConnection('testpeer1234567890abcdef.onion'), isFalse);
     });
   });
 }

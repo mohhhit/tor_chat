@@ -16,7 +16,8 @@ enum MessageStatus {
 
 enum MessageType {
   text,
-  image;
+  image,
+  call;
 
   String get name => toString().split('.').last;
 

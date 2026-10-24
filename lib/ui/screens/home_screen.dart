@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import 'package:intl/intl.dart';
 import 'package:provider/provider.dart';
 import '../../models/contact.dart';
+import '../../models/tor_status.dart';
 import '../../providers/chat_provider.dart';
 import '../../services/p2p/chat_coordinator.dart';
 import '../theme/app_theme.dart';
@@ -308,12 +309,20 @@ class _HomeScreenState extends State<HomeScreen> {
               Widget contactsListWidget = Scaffold(
                 appBar: AppBar(
                   titleSpacing: 16,
-                  title: const Row(
+                  title: Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      Icon(Icons.security, color: AppTheme.torPurpleLight, size: 20),
-                      SizedBox(width: 8),
-                      Flexible(
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(4),
+                        child: Image.asset(
+                          'assets/icons/app_logo.png',
+                          width: 22,
+                          height: 22,
+                          fit: BoxFit.contain,
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      const Flexible(
                         child: Text(
                           'TorChat',
                           overflow: TextOverflow.ellipsis,
@@ -409,6 +418,45 @@ class _HomeScreenState extends State<HomeScreen> {
                             context.read<TorProvider>().requestIgnoreBatteryOptimization();
                           },
                           child: const Text('Allow', style: TextStyle(fontWeight: FontWeight.bold, color: AppTheme.torPurpleLight)),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+
+              // Tor Disconnected / Error Warning Banner
+              if (context.watch<TorProvider>().status.state == TorConnectionState.error)
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                  child: Container(
+                    decoration: BoxDecoration(
+                      color: AppTheme.errorRed.withValues(alpha: 0.15),
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(color: AppTheme.errorRed.withValues(alpha: 0.4)),
+                    ),
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                    child: Row(
+                      children: [
+                        const Icon(Icons.wifi_off_rounded, color: AppTheme.errorRed, size: 22),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Text(
+                            Platform.isAndroid
+                                ? 'Tor is offline. Please start Orbot (the official Tor app), then tap Retry.'
+                                : 'Tor connection error. Please verify Tor process is running.',
+                            style: const TextStyle(fontSize: 12, height: 1.25),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        TextButton(
+                          style: TextButton.styleFrom(
+                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                            visualDensity: VisualDensity.compact,
+                          ),
+                          onPressed: () {
+                            context.read<TorProvider>().restartTor();
+                          },
+                          child: const Text('Retry', style: TextStyle(fontWeight: FontWeight.bold, color: AppTheme.errorRed)),
                         ),
                       ],
                     ),
@@ -608,7 +656,17 @@ class _HomeScreenState extends State<HomeScreen> {
                                   color: AppTheme.torPurple.withValues(alpha: 0.12),
                                   shape: BoxShape.circle,
                                 ),
-                                child: const Icon(Icons.shield_outlined, size: 48, color: AppTheme.torPurpleLight),
+                                child: Center(
+                                  child: ClipRRect(
+                                    borderRadius: BorderRadius.circular(14),
+                                    child: Image.asset(
+                                      'assets/icons/app_logo.png',
+                                      width: 56,
+                                      height: 56,
+                                      fit: BoxFit.contain,
+                                    ),
+                                  ),
+                                ),
                               ),
                               const SizedBox(height: 20),
                               const Text(

@@ -24,10 +24,42 @@ class MainActivity : FlutterActivity() {
 
     override fun shouldDestroyEngineWithHost(): Boolean = false
 
+    fun applyLockscreenFlags(enable: Boolean) {
+        runOnUiThread {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+                setShowWhenLocked(enable)
+                setTurnScreenOn(enable)
+            } else {
+                if (enable) {
+                    @Suppress("DEPRECATION")
+                    window.addFlags(
+                        android.view.WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
+                        android.view.WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON or
+                        android.view.WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD or
+                        android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+                    )
+                } else {
+                    @Suppress("DEPRECATION")
+                    window.clearFlags(
+                        android.view.WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
+                        android.view.WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON or
+                        android.view.WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD or
+                        android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+                    )
+                }
+            }
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         currentActivity = this
         createMessageNotificationChannel(applicationContext)
+        NotificationHelper.createCallNotificationChannel(applicationContext)
+
+        if (intent?.getBooleanExtra("incoming_call", false) == true) {
+            applyLockscreenFlags(true)
+        }
 
         // Start Tor background service immediately to protect the process
         try {
@@ -68,6 +100,9 @@ class MainActivity : FlutterActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
+        if (intent.getBooleanExtra("incoming_call", false)) {
+            applyLockscreenFlags(true)
+        }
         val chatOnion = intent.getStringExtra("chat_onion")
         val currentEngine = TorEngineHolder.getOrCreateEngine(this)
         if (chatOnion != null) {
@@ -97,6 +132,14 @@ class MainActivity : FlutterActivity() {
         const val CHANNEL = "com.onionchat.tor_chat/native"
         const val MSG_CHANNEL_ID = NotificationHelper.MSG_CHANNEL_ID
         private var currentActivity: MainActivity? = null
+
+        fun turnScreenOnAndShowOnLockscreen() {
+            currentActivity?.applyLockscreenFlags(true)
+        }
+
+        fun resetLockscreenFlags() {
+            currentActivity?.applyLockscreenFlags(false)
+        }
 
         fun createMessageNotificationChannel(context: Context) {
             NotificationHelper.createNotificationChannel(context)
@@ -217,6 +260,77 @@ class MainActivity : FlutterActivity() {
                             result.success(true)
                         } catch (e: Exception) {
                             result.error("DISMISS_ERROR", e.message, null)
+                        }
+                    }
+                    "showIncomingCallNotification" -> {
+                        try {
+                            val callerOnion = call.argument<String>("callerOnion") ?: ""
+                            val callerNickname = call.argument<String>("callerNickname") ?: "Peer"
+                            val callId = call.argument<String>("callId") ?: ""
+                            NotificationHelper.showCallNotification(appContext, callerOnion, callerNickname, callId)
+                            result.success(true)
+                        } catch (e: Exception) {
+                            result.error("CALL_NOTIF_ERROR", e.message, null)
+                        }
+                    }
+                    "dismissCallNotification" -> {
+                        try {
+                            NotificationHelper.dismissCallNotification(appContext)
+                            result.success(true)
+                        } catch (e: Exception) {
+                            result.error("DISMISS_CALL_ERROR", e.message, null)
+                        }
+                    }
+                    "playDefaultRingtone" -> {
+                        try {
+                            NotificationHelper.playDefaultRingtone(appContext)
+                            result.success(true)
+                        } catch (e: Exception) {
+                            result.error("RINGTONE_ERROR", e.message, null)
+                        }
+                    }
+                    "stopDefaultRingtone" -> {
+                        try {
+                            NotificationHelper.stopDefaultRingtone()
+                            result.success(true)
+                        } catch (e: Exception) {
+                            result.error("RINGTONE_STOP_ERROR", e.message, null)
+                        }
+                    }
+                    "initVoiceStream" -> {
+                        try {
+                            val sampleRate = call.argument<Int>("sampleRate") ?: 16000
+                            val speakerphone = call.argument<Boolean>("speakerphone") ?: false
+                            VoiceStreamManager.initStream(appContext, sampleRate, speakerphone)
+                            result.success(true)
+                        } catch (e: Exception) {
+                            result.error("VOICE_INIT_ERROR", e.message, null)
+                        }
+                    }
+                    "writeVoiceChunk" -> {
+                        try {
+                            val bytes = call.argument<ByteArray>("bytes")
+                            VoiceStreamManager.writeChunk(bytes)
+                            result.success(true)
+                        } catch (e: Exception) {
+                            result.error("VOICE_WRITE_ERROR", e.message, null)
+                        }
+                    }
+                    "setSpeakerphone" -> {
+                        try {
+                            val enabled = call.argument<Boolean>("enabled") ?: false
+                            VoiceStreamManager.setSpeakerphone(appContext, enabled)
+                            result.success(true)
+                        } catch (e: Exception) {
+                            result.error("SPEAKER_ERROR", e.message, null)
+                        }
+                    }
+                    "stopVoiceStream" -> {
+                        try {
+                            VoiceStreamManager.stopStream(appContext)
+                            result.success(true)
+                        } catch (e: Exception) {
+                            result.error("VOICE_STOP_ERROR", e.message, null)
                         }
                     }
                     else -> result.notImplemented()

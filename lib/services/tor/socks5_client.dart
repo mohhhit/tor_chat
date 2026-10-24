@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
+import 'package:flutter/foundation.dart';
 
 class Socks5Response {
   final int statusCode;
@@ -188,8 +189,236 @@ class _SocketBufferReader {
     );
   }
 
+  TorTunneledSocket detachToTunneledSocket() {
+    final tunneled = TorTunneledSocket(socket);
+
+    // Emit any buffered data already read during SOCKS5 handshake
+    if (_buffer.length > 0) {
+      tunneled.feedData(_buffer.takeBytes());
+    }
+
+    if (_isClosed) {
+      tunneled.feedDone();
+    } else if (_error != null) {
+      tunneled.feedError(_error!);
+    } else {
+      _subscription.onData((data) {
+        tunneled.feedData(data);
+      });
+      _subscription.onError((err, st) {
+        tunneled.feedError(err, st);
+      });
+      _subscription.onDone(() {
+        tunneled.feedDone();
+      });
+    }
+
+    return tunneled;
+  }
+
   Future<void> cancel() async {
     await _subscription.cancel();
+  }
+}
+
+/// A Socket wrapper that implements [Socket] and extends [Stream<Uint8List>].
+/// Allows handshaking a raw TCP connection (like SOCKS5) without exhausting the
+/// socket's single-subscription stream before handing it to HttpClient / WebSocket.
+/// Safely supports multiple or sequential listeners without throwing "Stream has already been listened to".
+class TorTunneledSocket extends Stream<Uint8List> implements Socket {
+  final Socket _rawSocket;
+  final List<Uint8List> _buffer = [];
+  bool _isClosed = false;
+  Object? _error;
+  StackTrace? _stackTrace;
+  void Function(Uint8List)? _onData;
+  Function? _onError;
+  void Function()? _onDone;
+
+  TorTunneledSocket(this._rawSocket);
+
+  void feedData(Uint8List data) {
+    if (_onData != null) {
+      _onData!(data);
+    } else {
+      _buffer.add(data);
+    }
+  }
+
+  void feedError(Object error, [StackTrace? stackTrace]) {
+    _error = error;
+    _stackTrace = stackTrace;
+    if (_onError != null) {
+      if (_onError is void Function(Object, StackTrace)) {
+        (_onError as void Function(Object, StackTrace))(error, stackTrace ?? StackTrace.current);
+      } else {
+        (_onError as void Function(Object))(error);
+      }
+    }
+  }
+
+  void feedDone() {
+    _isClosed = true;
+    if (_onDone != null) {
+      _onDone!();
+    }
+  }
+
+  @override
+  InternetAddress get address => _rawSocket.address;
+
+  @override
+  int get port => _rawSocket.port;
+
+  @override
+  InternetAddress get remoteAddress => _rawSocket.remoteAddress;
+
+  @override
+  int get remotePort => _rawSocket.remotePort;
+
+  @override
+  bool setOption(SocketOption option, bool enabled) => _rawSocket.setOption(option, enabled);
+
+  @override
+  Uint8List getRawOption(RawSocketOption option) => _rawSocket.getRawOption(option);
+
+  @override
+  void setRawOption(RawSocketOption option) => _rawSocket.setRawOption(option);
+
+  @override
+  void destroy() => _rawSocket.destroy();
+
+  @override
+  Future close() => _rawSocket.close();
+
+  @override
+  Future get done => _rawSocket.done;
+
+  @override
+  void add(List<int> data) => _rawSocket.add(data);
+
+  @override
+  void addError(Object error, [StackTrace? stackTrace]) => _rawSocket.addError(error, stackTrace);
+
+  @override
+  Future addStream(Stream<List<int>> stream) => _rawSocket.addStream(stream);
+
+  @override
+  Future flush() => _rawSocket.flush();
+
+  @override
+  void write(Object? object) => _rawSocket.write(object);
+
+  @override
+  void writeAll(Iterable objects, [String separator = ""]) => _rawSocket.writeAll(objects, separator);
+
+  @override
+  void writeCharCode(int charCode) => _rawSocket.writeCharCode(charCode);
+
+  @override
+  void writeln([Object? object = ""]) => _rawSocket.writeln(object);
+
+  @override
+  Encoding get encoding => _rawSocket.encoding;
+
+  @override
+  set encoding(Encoding value) => _rawSocket.encoding = value;
+
+  @override
+  StreamSubscription<Uint8List> listen(
+    void Function(Uint8List event)? onData, {
+    Function? onError,
+    void Function()? onDone,
+    bool? cancelOnError,
+  }) {
+    _onData = onData;
+    _onError = onError;
+    _onDone = onDone;
+
+    // Deliver any queued buffer immediately to the new listener
+    if (_buffer.isNotEmpty && onData != null) {
+      final chunks = List<Uint8List>.from(_buffer);
+      _buffer.clear();
+      scheduleMicrotask(() {
+        for (final chunk in chunks) {
+          if (_onData != null) _onData!(chunk);
+        }
+        if (_isClosed && _onDone != null) {
+          _onDone!();
+        }
+      });
+    } else if (_isClosed && onDone != null) {
+      scheduleMicrotask(onDone);
+    }
+
+    if (_error != null && onError != null) {
+      scheduleMicrotask(() {
+        if (_onError != null) {
+          if (_onError is void Function(Object, StackTrace)) {
+            (_onError as void Function(Object, StackTrace))(_error!, _stackTrace ?? StackTrace.current);
+          } else {
+            (_onError as void Function(Object))(_error!);
+          }
+        }
+      });
+    }
+
+    return _TunneledSocketSubscription(this);
+  }
+}
+
+class _TunneledSocketSubscription implements StreamSubscription<Uint8List> {
+  final TorTunneledSocket _tunneled;
+  bool _isPaused = false;
+
+  _TunneledSocketSubscription(this._tunneled);
+
+  @override
+  Future<void> cancel() async {
+    _tunneled._onData = null;
+    _tunneled._onError = null;
+    _tunneled._onDone = null;
+  }
+
+  @override
+  void onData(void Function(Uint8List data)? handleData) {
+    _tunneled._onData = handleData;
+  }
+
+  @override
+  void onError(Function? handleError) {
+    _tunneled._onError = handleError;
+  }
+
+  @override
+  void onDone(void Function()? handleDone) {
+    _tunneled._onDone = handleDone;
+  }
+
+  @override
+  void pause([Future<void>? resumeSignal]) {
+    _isPaused = true;
+    resumeSignal?.then((_) => resume());
+  }
+
+  @override
+  void resume() {
+    _isPaused = false;
+  }
+
+  @override
+  bool get isPaused => _isPaused;
+
+  @override
+  Future<E> asFuture<E>([E? futureValue]) {
+    final completer = Completer<E>();
+    _tunneled._onDone = () {
+      completer.complete(futureValue as E);
+    };
+    _tunneled._onError = (err, [st]) {
+      completer.completeError(err, st);
+    };
+    return completer.future;
   }
 }
 
@@ -222,16 +451,60 @@ class _PooledSocket {
   }
 }
 
+class SocksTimeouts {
+  static const handshake = Duration(seconds: 10);     // talking to local tor: should be instant
+  static const connectReply = Duration(seconds: 120);  // onion rendezvous can be slow when cold
+  static const warmConnectReply = Duration(seconds: 35); // existing or recent warm circuit
+  static const httpRequest = Duration(seconds: 25);
+}
+
 class Socks5Client {
   final String proxyHost;
   final int proxyPort;
   final Map<String, _PooledSocket> _pool = {};
   final Map<String, Future<void>> _peerQueues = {};
+  final Map<String, Future<_PooledSocket>> _inflightConnections = {};
+  final Map<String, DateTime> _lastSuccessTime = {};
 
   Socks5Client({
     this.proxyHost = '127.0.0.1',
     this.proxyPort = 9050,
   });
+
+  /// Checks if a live, non-expired pooled socket already exists for this peer,
+  /// or if a request succeeded to this peer in the last 3 minutes.
+  bool hasWarmConnection(String onionAddress, {int port = 80}) {
+    final poolKey = '${onionAddress.trim()}:$port';
+    final pooled = _pool[poolKey];
+    if (pooled != null && !pooled.isClosed && !pooled.isExpired) {
+      return true;
+    }
+    final lastSuccess = _lastSuccessTime[poolKey];
+    if (lastSuccess != null) {
+      final elapsed = DateTime.now().difference(lastSuccess);
+      if (elapsed < const Duration(minutes: 3)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /// Creates a dedicated, non-pooled SOCKS5 tunnel to [targetHost]:[targetPort] and returns a live [Socket].
+  /// Useful for long-lived streaming connections like WebSockets or Voice Calls.
+  Future<Socket> createRawTunnel(
+    String targetHost,
+    int targetPort, {
+    Duration? timeout,
+  }) async {
+    final isKnownWarm = hasWarmConnection(targetHost, port: targetPort);
+    final pooled = await _createConnection(
+      targetHost,
+      targetPort,
+      timeout: timeout,
+      isKnownWarm: isKnownWarm,
+    );
+    return pooled.reader.detachToTunneledSocket();
+  }
 
   /// Serializes operations to the same peer to guarantee in-order HTTP requests
   /// and reuse the persistent keep-alive socket safely without stream interleaving.
@@ -275,18 +548,22 @@ class Socks5Client {
   }
 
   /// Establishes and handshakes a raw Tor SOCKS5 TCP tunnel to [targetHost]:[targetPort]
-  Future<_PooledSocket> _createConnection(String targetHost, int targetPort, Duration timeout) async {
+  Future<_PooledSocket> _createConnection(
+    String targetHost,
+    int targetPort, {
+    Duration? timeout,
+    bool isKnownWarm = false,
+  }) async {
     final cleanHost = targetHost.trim();
-    final socket = await Socket.connect(proxyHost, proxyPort, timeout: const Duration(seconds: 10));
+    final socket = await Socket.connect(proxyHost, proxyPort, timeout: SocksTimeouts.handshake);
     final reader = _SocketBufferReader(socket);
 
     try {
-      // 1. Initial Greeting / Auth method selection
-      // [VER=5, NMETHODS=1, METHOD=0 (No Auth)]
+      // 1. Initial Greeting / Auth method selection (local loopback, fast)
       socket.add([0x05, 0x01, 0x00]);
       await socket.flush();
 
-      final greetingResponse = await reader.readExact(2, const Duration(seconds: 5));
+      final greetingResponse = await reader.readExact(2, SocksTimeouts.handshake);
       if (greetingResponse[0] != 0x05 || greetingResponse[1] != 0x00) {
         throw Exception(
           'SOCKS5 proxy authentication failed (Code: ${greetingResponse[1]})',
@@ -310,7 +587,9 @@ class Socks5Client {
       await socket.flush();
 
       // 3. Read server reply header: [VER, REP, RSV, ATYP]
-      final replyHeader = await reader.readExact(4, timeout);
+      // Split timeouts: give cold rendezvous up to 120s, warm circuits 45s
+      final connectReplyTimeout = timeout ?? (isKnownWarm ? SocksTimeouts.warmConnectReply : SocksTimeouts.connectReply);
+      final replyHeader = await reader.readExact(4, connectReplyTimeout);
       final rep = replyHeader[1];
       if (rep != 0x00) {
         final reason = _getReplyErrorMessage(rep);
@@ -344,6 +623,34 @@ class Socks5Client {
     }
   }
 
+  /// Deduplicates in-flight connection requests to the same peer so concurrent attempts
+  /// do not start competing cold rendezvous circuits through Tor.
+  Future<_PooledSocket> _getOrCreateConnection(
+    String cleanHost,
+    int port, {
+    Duration? timeout,
+    bool isKnownWarm = false,
+  }) {
+    final poolKey = '$cleanHost:$port';
+
+    return _inflightConnections.putIfAbsent(poolKey, () async {
+      final sw = Stopwatch()..start();
+      try {
+        final pooled = await _createConnection(
+          cleanHost,
+          port,
+          timeout: timeout,
+          isKnownWarm: isKnownWarm,
+        );
+        _pool[poolKey] = pooled;
+        debugPrint('[tor_network] Connected to $cleanHost:$port in ${sw.elapsedMilliseconds}ms (${isKnownWarm ? "warm" : "cold"})');
+        return pooled;
+      } finally {
+        _inflightConnections.remove(poolKey);
+      }
+    });
+  }
+
   /// Sends an HTTP request through the persistent SOCKS5 connection pool
   /// Reuses existing open Tor circuits to achieve sub-second latency
   Future<Socks5Response> sendHttpRequest({
@@ -353,7 +660,7 @@ class Socks5Client {
     int port = 80,
     Map<String, String>? headers,
     String? body,
-    Duration timeout = const Duration(seconds: 40),
+    Duration timeout = SocksTimeouts.httpRequest,
   }) {
     final cleanHost = onionAddress.trim();
     final poolKey = '$cleanHost:$port';
@@ -373,9 +680,14 @@ class Socks5Client {
 
         bool isFresh = false;
         if (pooled == null) {
-          pooled = await _createConnection(cleanHost, port, timeout);
+          final isWarm = hasWarmConnection(cleanHost, port: port);
+          pooled = await _getOrCreateConnection(
+            cleanHost,
+            port,
+            timeout: isWarm ? SocksTimeouts.warmConnectReply : SocksTimeouts.connectReply,
+            isKnownWarm: isWarm,
+          );
           isFresh = true;
-          _pool[poolKey] = pooled;
         }
 
         pooled.isBusy = true;
@@ -399,6 +711,7 @@ class Socks5Client {
           }
           buffer.write('\r\n');
 
+          final sw = Stopwatch()..start();
           pooled.socket.add(utf8.encode(buffer.toString()));
           if (bodyBytes.isNotEmpty) {
             pooled.socket.add(bodyBytes);
@@ -406,6 +719,7 @@ class Socks5Client {
           await pooled.socket.flush();
 
           final response = await pooled.reader.readHttpResponse(timeout);
+          debugPrint('[tor_network] $method $path -> HTTP ${response.statusCode} in ${sw.elapsedMilliseconds}ms');
 
           if (response.headers['connection']?.toLowerCase() == 'close') {
             await pooled.close();
@@ -417,6 +731,7 @@ class Socks5Client {
             pooled.lastUsed = DateTime.now();
           }
 
+          _lastSuccessTime[poolKey] = DateTime.now();
           return response;
         } catch (e) {
           await pooled.close();
@@ -438,31 +753,16 @@ class Socks5Client {
   /// Pre-warms an onion circuit in the background so the user's first message delivers instantly
   Future<void> prewarm(String onionAddress, {int port = 80}) async {
     final cleanHost = onionAddress.trim();
-    final poolKey = '$cleanHost:$port';
 
-    final existing = _pool[poolKey];
-    if (existing != null && !existing.isClosed && !existing.isExpired) {
+    if (hasWarmConnection(cleanHost, port: port)) {
       return;
     }
 
-    return _synchronized(poolKey, () async {
-      final pooled = _pool[poolKey];
-      if (pooled != null && !pooled.isClosed && !pooled.isExpired) {
-        return;
-      }
-      if (pooled != null) {
-        await pooled.close();
-        if (identical(_pool[poolKey], pooled)) {
-          _pool.remove(poolKey);
-        }
-      }
-      try {
-        final newConn = await _createConnection(cleanHost, port, const Duration(seconds: 35));
-        _pool[poolKey] = newConn;
-      } catch (_) {
-        // Prewarm is best-effort background
-      }
-    });
+    try {
+      await _getOrCreateConnection(cleanHost, port, isKnownWarm: false);
+    } catch (_) {
+      // Prewarm is best-effort background
+    }
   }
 
   /// Closes all pooled connections on shutdown
